@@ -1,0 +1,60 @@
+name: Deploy both FPV simulators to GitHub Pages
+
+on:
+  push:
+    branches: [main, version-2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out version 1
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: v1
+      - name: Check out version 2
+        uses: actions/checkout@v4
+        with:
+          ref: version-2
+          path: v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build version 1
+        working-directory: v1
+        run: |
+          npm ci
+          npm run build
+      - name: Build version 2
+        working-directory: v2
+        run: |
+          npm ci
+          npm run build
+      - name: Put version 2 at /v2/
+        run: |
+          mkdir -p v1/dist/v2
+          cp -a v2/dist/. v1/dist/v2/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: v1/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
