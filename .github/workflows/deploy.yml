@@ -2,7 +2,7 @@ name: Deploy both FPV simulators to GitHub Pages
 
 on:
   push:
-    branches: [main, version-2]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
