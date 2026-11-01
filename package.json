@@ -1,0 +1,22 @@
+{
+  "name": "fpv-drone-sim",
+  "version": "1.0.0",
+  "description": "FPV POLYGON — браузерный симулятор учебно-боевого FPV-дрона (Three.js + Rapier3D)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.21.0",
+    "three": "^0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.187.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5"
+  }
+}
