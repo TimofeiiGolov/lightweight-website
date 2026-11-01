@@ -1,222 +1,256 @@
-import * as THREE from 'three';
+import {
+  AdditiveBlending,
+  BufferAttribute,
+  BufferGeometry,
+  Color,
+  Group,
+  Mesh,
+  MeshBasicMaterial,
+  NormalBlending,
+  Points,
+  RingGeometry,
+  ShaderMaterial,
+  SphereGeometry,
+  Vector3,
+} from 'three';
 
-interface Pool {
-  points: THREE.Points;
-  geo: THREE.BufferGeometry;
-  pos: Float32Array;
-  col: Float32Array;
-  size: Float32Array;
-  alpha: Float32Array;
-  vel: Float32Array;
-  life: Float32Array;
-  maxLife: Float32Array;
-  grav: Float32Array;
-  dragK: number;
-  cursor: number;
-  count: number;
-}
+type RGB = [number, number, number];
+const rgb = (hex: number): RGB => {
+  const c = new Color(hex);
+  return [c.r, c.g, c.b];
+};
 
-/**
- * Пул частиц (взрывы, искры, дым, пыль) на кастомном шейдере.
- * CPU-обновление, без аллокаций в кадре.
- */
-export class Particles {
-  readonly group = new THREE.Group();
-  private fire: Pool;
-  private smoke: Pool;
-  private decals: THREE.Mesh[] = [];
-  private decalCursor = 0;
-  private disposables: Array<{ dispose(): void }> = [];
+const VERT = /* glsl */ `
+attribute vec4 aColor;
+attribute float aSize;
+uniform float uScale;
+varying vec4 vColor;
+void main(){
+  vColor = aColor;
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  gl_Position = projectionMatrix * mv;
+  gl_PointSize = min(aSize * uScale / max(-mv.z, 0.1), 160.0);
+}`;
+const FRAG = /* glsl */ `
+varying vec4 vColor;
+void main(){
+  float d = length(gl_PointCoord - 0.5);
+  float a = smoothstep(0.5, 0.12, d);
+  if (a < 0.01) discard;
+  gl_FragColor = vec4(vColor.rgb, vColor.a * a);
+}`;
 
-  private static FIRE_N = 320;
-  private static SMOKE_N = 200;
+/** Пул частиц на Points: один draw call на систему, CPU-обновление */
+class ParticleSystem {
+  points: Points;
+  private pos: Float32Array;
+  private col: Float32Array;
+  private size: Float32Array;
+  private vel: Float32Array;
+  private life: Float32Array;
+  private maxLife: Float32Array;
+  private s0: Float32Array;
+  private s1: Float32Array;
+  private c0: Float32Array;
+  private c1: Float32Array;
+  private a0: Float32Array;
+  private drag: Float32Array;
+  private grav: Float32Array;
+  private next = 0;
+  material: ShaderMaterial;
 
-  constructor() {
-    this.fire = this.makePool(Particles.FIRE_N, THREE.AdditiveBlending, false);
-    this.smoke = this.makePool(Particles.SMOKE_N, THREE.NormalBlending, true);
-    this.makeDecals();
-  }
-
-  private makePool(n: number, blending: THREE.Blending, isSmoke: boolean): Pool {
-    const geo = new THREE.BufferGeometry();
-    const pos = new Float32Array(n * 3);
-    const col = new Float32Array(n * 3);
-    const size = new Float32Array(n);
-    const alpha = new Float32Array(n);
-    const vel = new Float32Array(n * 3);
-    const life = new Float32Array(n);
-    const maxLife = new Float32Array(n);
-    const grav = new Float32Array(n);
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
-    geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
-    geo.setAttribute('aAlpha', new THREE.BufferAttribute(alpha, 1));
-    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 500);
-
-    const mat = new THREE.ShaderMaterial({
+  constructor(private max: number, additive: boolean) {
+    this.pos = new Float32Array(max * 3);
+    this.col = new Float32Array(max * 4);
+    this.size = new Float32Array(max);
+    this.vel = new Float32Array(max * 3);
+    this.life = new Float32Array(max);
+    this.maxLife = new Float32Array(max).fill(1);
+    this.s0 = new Float32Array(max);
+    this.s1 = new Float32Array(max);
+    this.c0 = new Float32Array(max * 3);
+    this.c1 = new Float32Array(max * 3);
+    this.a0 = new Float32Array(max);
+    this.drag = new Float32Array(max);
+    this.grav = new Float32Array(max);
+    for (let i = 0; i < max; i++) this.pos[i * 3 + 1] = -1000;
+    const g = new BufferGeometry();
+    g.setAttribute('position', new BufferAttribute(this.pos, 3).setUsage(35048));
+    g.setAttribute('aColor', new BufferAttribute(this.col, 4).setUsage(35048));
+    g.setAttribute('aSize', new BufferAttribute(this.size, 1).setUsage(35048));
+    this.material = new ShaderMaterial({
+      uniforms: { uScale: { value: 500 } },
+      vertexShader: VERT,
+      fragmentShader: FRAG,
       transparent: true,
       depthWrite: false,
-      blending,
-      uniforms: {},
-      vertexShader: /* glsl */ `
-        attribute vec3 aColor;
-        attribute float aSize;
-        attribute float aAlpha;
-        varying vec3 vColor;
-        varying float vAlpha;
-        void main() {
-          vColor = aColor;
-          vAlpha = aAlpha;
-          vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          gl_PointSize = aSize * (240.0 / max(1.0, -mv.z));
-          gl_Position = projectionMatrix * mv;
-        }
-      `,
-      fragmentShader: /* glsl */ `
-        varying vec3 vColor;
-        varying float vAlpha;
-        void main() {
-          vec2 d = gl_PointCoord - 0.5;
-          float r = length(d);
-          if (r > 0.5) discard;
-          float soft = smoothstep(0.5, ${isSmoke ? '0.1' : '0.05'}, r);
-          gl_FragColor = vec4(vColor, vAlpha * soft);
-        }
-      `,
+      blending: additive ? AdditiveBlending : NormalBlending,
     });
-    this.disposables.push(geo, mat);
-
-    const points = new THREE.Points(geo, mat);
-    points.frustumCulled = false;
-    this.group.add(points);
-    return { points, geo, pos, col, size, alpha, vel, life, maxLife, grav, dragK: isSmoke ? 1.2 : 0.6, cursor: 0, count: n };
+    this.points = new Points(g, this.material);
+    this.points.frustumCulled = false;
   }
 
-  private makeDecals(): void {
-    const geo = new THREE.CircleGeometry(1.7, 20);
-    const mat = new THREE.MeshBasicMaterial({ color: 0x14140f, transparent: true, opacity: 0.7, depthWrite: false });
-    this.disposables.push(geo, mat);
-    for (let i = 0; i < 12; i++) {
-      const m = new THREE.Mesh(geo, mat);
-      m.rotation.x = -Math.PI / 2;
-      m.visible = false;
-      m.renderOrder = 1;
-      this.decals.push(m);
-      this.group.add(m);
-    }
+  emit(p: Vector3, vx: number, vy: number, vz: number, life: number, s0: number, s1: number, c0: RGB, c1: RGB, a0 = 1, drag = 1, grav = 0) {
+    const i = this.next;
+    this.next = (this.next + 1) % this.max;
+    this.pos[i * 3] = p.x;
+    this.pos[i * 3 + 1] = p.y;
+    this.pos[i * 3 + 2] = p.z;
+    this.vel[i * 3] = vx;
+    this.vel[i * 3 + 1] = vy;
+    this.vel[i * 3 + 2] = vz;
+    this.life[i] = this.maxLife[i] = life;
+    this.s0[i] = s0;
+    this.s1[i] = s1;
+    this.c0.set(c0, i * 3);
+    this.c1.set(c1, i * 3);
+    this.a0[i] = a0;
+    this.drag[i] = drag;
+    this.grav[i] = grav;
   }
 
-  private spawn(p: Pool, x: number, y: number, z: number, vx: number, vy: number, vz: number, r: number, g: number, b: number, size: number, life: number, grav: number): void {
-    const i = p.cursor;
-    p.cursor = (p.cursor + 1) % p.count;
-    p.pos[i * 3] = x;
-    p.pos[i * 3 + 1] = y;
-    p.pos[i * 3 + 2] = z;
-    p.vel[i * 3] = vx;
-    p.vel[i * 3 + 1] = vy;
-    p.vel[i * 3 + 2] = vz;
-    p.col[i * 3] = r;
-    p.col[i * 3 + 1] = g;
-    p.col[i * 3 + 2] = b;
-    p.size[i] = size;
-    p.alpha[i] = 1;
-    p.life[i] = life;
-    p.maxLife[i] = life;
-    p.grav[i] = grav;
-  }
-
-  /** Взрыв: вспышка, огонь, дым */
-  explosion(x: number, y: number, z: number, scale = 1): void {
-    for (let i = 0; i < 70; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const el = Math.random() * Math.PI - Math.PI / 2;
-      const sp = (2 + Math.random() * 8) * scale;
-      const hot = Math.random();
-      this.spawn(
-        this.fire, x, y, z,
-        Math.cos(a) * Math.cos(el) * sp, Math.sin(el) * sp * 0.8 + 1.5, Math.sin(a) * Math.cos(el) * sp,
-        1.0, hot > 0.5 ? 0.55 + hot * 0.3 : 0.3, hot > 0.7 ? 0.15 : 0.05,
-        (0.5 + Math.random() * 0.7) * scale, 0.35 + Math.random() * 0.5, -3
-      );
-    }
-    for (let i = 0; i < 34; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const sp = 0.5 + Math.random() * 2.2;
-      this.spawn(
-        this.smoke, x, y + 0.4, z,
-        Math.cos(a) * sp, 1.2 + Math.random() * 2.4, Math.sin(a) * sp,
-        0.16, 0.15, 0.13,
-        (1.4 + Math.random() * 1.6) * scale, 1.8 + Math.random() * 1.6, 1.6
-      );
-    }
-    // декаль на земле
-    const decal = this.decals[this.decalCursor];
-    this.decalCursor = (this.decalCursor + 1) % this.decals.length;
-    decal.position.set(x, 0.03, z);
-    decal.visible = true;
-    decal.scale.setScalar(0.6 + scale * 0.5);
-  }
-
-  /** Искры при жёстком ударе дрона */
-  sparks(x: number, y: number, z: number): void {
-    for (let i = 0; i < 26; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const el = Math.random() * Math.PI / 2;
-      const sp = 3 + Math.random() * 9;
-      this.spawn(
-        this.fire, x, y, z,
-        Math.cos(a) * Math.cos(el) * sp, Math.sin(el) * sp, Math.sin(a) * Math.cos(el) * sp,
-        1.0, 0.85, 0.3,
-        0.1 + Math.random() * 0.12, 0.25 + Math.random() * 0.4, -9.8
-      );
-    }
-    for (let i = 0; i < 10; i++) {
-      this.spawn(this.smoke, x, y, z, (Math.random() - 0.5) * 1.4, 0.8 + Math.random(), (Math.random() - 0.5) * 1.4,
-        0.12, 0.12, 0.11, 0.7 + Math.random() * 0.6, 1.0 + Math.random() * 0.8, 1.2);
-    }
-  }
-
-  /** Пыль при жёсткой посадке */
-  dust(x: number, y: number, z: number): void {
-    for (let i = 0; i < 12; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const sp = 0.8 + Math.random() * 2.4;
-      this.spawn(this.smoke, x, y + 0.1, z,
-        Math.cos(a) * sp, 0.4 + Math.random() * 0.8, Math.sin(a) * sp,
-        0.42, 0.38, 0.28, 0.5 + Math.random() * 0.5, 0.5 + Math.random() * 0.4, 2.5);
-    }
-  }
-
-  update(dt: number): void {
-    for (const p of [this.fire, this.smoke]) {
-      const { pos, vel, life, maxLife, alpha, grav, count } = p;
-      for (let i = 0; i < count; i++) {
-        if (life[i] <= 0) {
-          alpha[i] = 0;
-          continue;
-        }
-        life[i] -= dt;
-        const k = Math.max(0, life[i] / maxLife[i]);
-        alpha[i] = k * k * (p === this.smoke ? 0.55 : 0.95);
-        vel[i * 3 + 1] -= grav[i] * dt;
-        const dr = 1 - p.dragK * dt;
-        vel[i * 3] *= dr;
-        vel[i * 3 + 2] *= dr;
-        pos[i * 3] += vel[i * 3] * dt;
-        pos[i * 3 + 1] += vel[i * 3 + 1] * dt;
-        pos[i * 3 + 2] += vel[i * 3 + 2] * dt;
-        // дым растёт
-        if (p === this.smoke) p.size[i] += dt * 0.9;
+  update(dt: number) {
+    for (let i = 0; i < this.max; i++) {
+      const l = this.life[i];
+      if (l <= 0) {
+        if (this.size[i] !== 0) this.size[i] = 0;
+        continue;
       }
-      p.geo.attributes.position.needsUpdate = true;
-      (p.geo.attributes.aColor as THREE.BufferAttribute).needsUpdate = false;
-      (p.geo.attributes.aAlpha as THREE.BufferAttribute).needsUpdate = true;
-      (p.geo.attributes.aSize as THREE.BufferAttribute).needsUpdate = true;
+      const nl = l - dt;
+      this.life[i] = nl;
+      if (nl <= 0) {
+        this.size[i] = 0;
+        this.col[i * 4 + 3] = 0;
+        continue;
+      }
+      const k = 1 - nl / this.maxLife[i]; // 0..1
+      const dr = Math.exp(-this.drag[i] * dt);
+      this.vel[i * 3] *= dr;
+      this.vel[i * 3 + 1] = this.vel[i * 3 + 1] * dr - this.grav[i] * dt;
+      this.vel[i * 3 + 2] *= dr;
+      this.pos[i * 3] += this.vel[i * 3] * dt;
+      this.pos[i * 3 + 1] += this.vel[i * 3 + 1] * dt;
+      this.pos[i * 3 + 2] += this.vel[i * 3 + 2] * dt;
+      if (this.pos[i * 3 + 1] < 0.05 && this.grav[i] > 0) {
+        this.pos[i * 3 + 1] = 0.05;
+        this.vel[i * 3 + 1] *= -0.3;
+      }
+      this.size[i] = this.s0[i] + (this.s1[i] - this.s0[i]) * k;
+      this.col[i * 4] = this.c0[i * 3] + (this.c1[i * 3] - this.c0[i * 3]) * k;
+      this.col[i * 4 + 1] = this.c0[i * 3 + 1] + (this.c1[i * 3 + 1] - this.c0[i * 3 + 1]) * k;
+      this.col[i * 4 + 2] = this.c0[i * 3 + 2] + (this.c1[i * 3 + 2] - this.c0[i * 3 + 2]) * k;
+      this.col[i * 4 + 3] = this.a0[i] * Math.min(1, (1 - k) * 2.2) * Math.min(1, k * 12 + 0.2);
+    }
+    const g = this.points.geometry;
+    (g.getAttribute('position') as BufferAttribute).needsUpdate = true;
+    (g.getAttribute('aColor') as BufferAttribute).needsUpdate = true;
+    (g.getAttribute('aSize') as BufferAttribute).needsUpdate = true;
+  }
+}
+
+interface Flash {
+  mesh: Mesh;
+  ring: Mesh;
+  t: number;
+}
+
+/** Стилизованные эффекты: взрывы, искры, дым, пыль */
+export class Particles {
+  group = new Group();
+  private fire = new ParticleSystem(700, true);
+  private smoke = new ParticleSystem(900, false);
+  private flashes: Flash[] = [];
+  private v = new Vector3();
+  private cFire0 = rgb(0xffa030);
+  private cFire1 = rgb(0x501005);
+  private cSpark0 = rgb(0xffe9a0);
+  private cSpark1 = rgb(0xff5a10);
+  private cSmoke0 = rgb(0x2a2927);
+  private cSmoke1 = rgb(0x6c6a66);
+  private cDust0 = rgb(0x8a7d62);
+  private cDust1 = rgb(0x9b9484);
+  private r = (a: number) => (Math.random() - 0.5) * 2 * a;
+
+  constructor() {
+    this.group.add(this.smoke.points, this.fire.points);
+    const fm = () => new MeshBasicMaterial({ color: 0xffc070, transparent: true, opacity: 0, blending: AdditiveBlending, depthWrite: false });
+    for (let i = 0; i < 3; i++) {
+      const mesh = new Mesh(new SphereGeometry(1, 12, 8), fm());
+      const ring = new Mesh(new RingGeometry(0.85, 1, 32), new MeshBasicMaterial({ color: 0xffe0b0, transparent: true, opacity: 0, side: 2, depthWrite: false }));
+      ring.rotation.x = -Math.PI / 2;
+      mesh.visible = ring.visible = false;
+      this.group.add(mesh, ring);
+      this.flashes.push({ mesh, ring, t: 99 });
     }
   }
 
-  dispose(scene: THREE.Scene): void {
-    scene.remove(this.group);
-    for (const d of this.disposables) d.dispose();
+  setScale(heightPx: number, fovDeg: number) {
+    const s = heightPx / (2 * Math.tan((fovDeg * Math.PI) / 360));
+    this.fire.material.uniforms.uScale.value = s;
+    this.smoke.material.uniforms.uScale.value = s;
+  }
+
+  explosion(p: Vector3, big = 1) {
+    const r = this.r;
+    for (let i = 0; i < 38 * big; i++) {
+      this.fire.emit(p, r(5 * big), Math.random() * 6 * big + 1, r(5 * big), 0.45 + Math.random() * 0.7, 2.2 * big, 6.5 * big, this.cFire0, this.cFire1, 1, 2.2);
+    }
+    for (let i = 0; i < 36; i++) {
+      this.fire.emit(p, r(16), Math.random() * 14 + 2, r(16), 0.5 + Math.random() * 0.6, 0.35, 0.1, this.cSpark0, this.cSpark1, 1, 0.4, 9);
+    }
+    for (let i = 0; i < 34 * big; i++) {
+      this.v.set(p.x + r(1.2), p.y + Math.random(), p.z + r(1.2));
+      this.smoke.emit(this.v, r(2.5), 1.2 + Math.random() * 3, r(2.5), 2.5 + Math.random() * 2.5, 3, 10 * big, this.cSmoke0, this.cSmoke1, 0.85, 0.8);
+    }
+    for (let i = 0; i < 22; i++) {
+      const a = Math.random() * 6.28;
+      const sp = 6 + Math.random() * 8;
+      this.smoke.emit(p, Math.cos(a) * sp, 0.4, Math.sin(a) * sp, 1.3, 2.5, 7, this.cDust0, this.cDust1, 0.5, 3);
+    }
+    const f = this.flashes.find((x) => x.t > 1) ?? this.flashes[0];
+    f.t = 0;
+    f.mesh.position.copy(p);
+    f.ring.position.set(p.x, p.y + 0.15, p.z);
+    f.mesh.visible = f.ring.visible = true;
+    f.mesh.scale.setScalar(1);
+  }
+
+  sparks(p: Vector3, n = 20, power = 1) {
+    const r = this.r;
+    for (let i = 0; i < n; i++) {
+      this.fire.emit(p, r(5 * power), Math.random() * 4 * power, r(5 * power), 0.3 + Math.random() * 0.4, 0.2, 0.06, this.cSpark0, this.cSpark1, 1, 0.5, 9);
+    }
+  }
+
+  smokePuff(p: Vector3, n = 1, size = 1.2) {
+    for (let i = 0; i < n; i++) {
+      this.smoke.emit(p, this.r(0.4), 0.8 + Math.random() * 0.8, this.r(0.4), 2 + Math.random() * 1.5, size * 0.6, size * 3, this.cSmoke0, this.cSmoke1, 0.7, 0.6);
+    }
+  }
+
+  dust(p: Vector3, outward: Vector3, n = 2) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * 6.28;
+      const sp = 3 + Math.random() * 3;
+      this.smoke.emit(p, Math.cos(a) * sp + outward.x, 0.3 + Math.random() * 0.6, Math.sin(a) * sp + outward.z, 0.9, 0.4, 1.8, this.cDust0, this.cDust1, 0.35, 2.2);
+    }
+  }
+
+  update(dt: number) {
+    this.fire.update(dt);
+    this.smoke.update(dt);
+    for (const f of this.flashes) {
+      if (f.t > 1) continue;
+      f.t += dt * 2.6;
+      const k = f.t;
+      if (k > 1) {
+        f.mesh.visible = f.ring.visible = false;
+        continue;
+      }
+      f.mesh.scale.setScalar(1 + k * 5);
+      (f.mesh.material as MeshBasicMaterial).opacity = (1 - k) * 0.9;
+      f.ring.scale.setScalar(1 + k * 9);
+      (f.ring.material as MeshBasicMaterial).opacity = (1 - k) * 0.7;
+    }
   }
 }

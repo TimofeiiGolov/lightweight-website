@@ -1,114 +1,143 @@
-import * as THREE from 'three';
-import { PAYLOAD } from '../config';
-import { segmentHitsAABB } from '../utils/MathUtils';
+import { ConeGeometry, CylinderGeometry, Group, Mesh, MeshLambertMaterial, Vector3 } from 'three';
+import { PHYS } from '../config';
+import type { WorldPhysics } from '../physics/WorldPhysics';
+import { terrainHeight } from '../utils/MathUtils';
+import type { Target, Targets } from '../world/Targets';
 
-export interface PayloadDropResult {
-  point: THREE.Vector3;
-  onGround: boolean;
+export interface PayloadImpact {
+  pos: Vector3;
+  direct: Target | null;
+}
+
+interface Item {
+  mesh: Group;
+  pos: Vector3;
+  vel: Vector3;
+  age: number;
 }
 
 /**
- * Условный учебный груз: баллистический снаряд.
- * Интегрируется вручную (гравитация + сопротивление), коллизии —
- * отрезок шага против AABB зданий и земли. Взрыв обрабатывает Game.
+ * Условная «полезная нагрузка» (учебный макет): лёгкий баллистический снаряд.
+ * Никаких реальных характеристик — только игровая механика: падение, контакт, визуальный эффект и очки.
  */
-export class Payload {
-  active = false;      // летит
-  ready = true;        // доступен для сброса
-  rearmT = 0;
+export class PayloadSystem {
+  group = new Group();
+  private items: Item[] = [];
+  private pool: Group[] = [];
+  private dir = new Vector3();
+  private prev = new Vector3();
 
-  readonly mesh: THREE.Group;
-  private pos = new THREE.Vector3();
-  private vel = new THREE.Vector3();
-  private prev = new THREE.Vector3();
-  private matBody: THREE.MeshStandardMaterial;
-
-  constructor() {
-    this.matBody = new THREE.MeshStandardMaterial({ color: 0x2f3a22, roughness: 0.8 });
-    this.mesh = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.14, 4, 10), this.matBody);
-    this.mesh.add(body);
-    for (const a of [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2]) {
-      const fin = new THREE.Mesh(new THREE.BoxGeometry(0.01, 0.07, 0.04), this.matBody);
-      fin.position.set(Math.sin(a) * 0.04, -0.09, Math.cos(a) * 0.04);
-      fin.rotation.y = a;
-      this.mesh.add(fin);
+  constructor(
+    private phys: WorldPhysics,
+    private targets: Targets,
+    private onImpact: (i: PayloadImpact) => void,
+  ) {
+    const mat = new MeshLambertMaterial({ color: 0x59633f });
+    const red = new MeshLambertMaterial({ color: 0xb8302a });
+    for (let i = 0; i < 6; i++) {
+      const g = new Group();
+      const body = new Mesh(new CylinderGeometry(0.05, 0.05, 0.24, 10), mat);
+      const nose = new Mesh(new ConeGeometry(0.05, 0.08, 10), red);
+      nose.position.y = 0.16;
+      g.add(body, nose);
+      g.visible = false;
+      this.group.add(g);
+      this.pool.push(g);
     }
-    this.mesh.visible = false;
   }
 
-  drop(fromPos: THREE.Vector3, fromVel: THREE.Vector3, droneQuat: THREE.Quaternion): boolean {
-    if (!this.ready || this.active) return false;
-    this.active = true;
-    this.ready = false;
-    this.pos.copy(fromPos);
-    this.pos.y -= 0.12;
-    this.vel.copy(fromVel);
-    this.vel.y -= 1.0;
-    this.prev.copy(this.pos);
-    this.mesh.position.copy(this.pos);
-    this.mesh.quaternion.copy(droneQuat);
-    this.mesh.visible = true;
-    return true;
+  get pending() {
+    return this.items.length;
   }
 
-  /**
-   * Шаг интегрирования. Возвращает точку взрыва или null.
-   * boxes — AABB зданий/техники (уже расширенные на радиус груза).
-   */
-  update(dt: number, boxes: THREE.Box3[]): PayloadDropResult | null {
-    if (!this.active) return null;
-    this.prev.copy(this.pos);
-    this.vel.y -= 9.81 * dt;
-    this.vel.multiplyScalar(1 - PAYLOAD.dragK * dt * 60 * dt); // лёгкое сопротивление
-    this.pos.addScaledVector(this.vel, dt);
+  drop(pos: Vector3, vel: Vector3) {
+    const mesh = this.pool.find((g) => !g.visible);
+    if (!mesh) return;
+    mesh.visible = true;
+    this.items.push({ mesh, pos: pos.clone(), vel: vel.clone(), age: 0 });
+  }
 
-    // ориентация по скорости
-    if (this.vel.lengthSq() > 0.5) {
-      const targetQ = new THREE.Quaternion().setFromUnitVectors(
-        new THREE.Vector3(0, 1, 0),
-        this.vel.clone().normalize()
-      );
-      this.mesh.quaternion.slerp(targetQ, Math.min(1, dt * 6));
-    }
-    this.mesh.position.copy(this.pos);
+  clear() {
+    for (const it of this.items) it.mesh.visible = false;
+    this.items.length = 0;
+  }
 
-    // земля
-    if (this.pos.y <= 0.1) {
-      this.pos.y = 0.1;
-      return this.explode(true);
-    }
-    // здания
-    const dx = this.pos.x - this.prev.x;
-    const dy = this.pos.y - this.prev.y;
-    const dz = this.pos.z - this.prev.z;
-    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (len > 1e-6) {
-      for (const b of boxes) {
-        if (segmentHitsAABB(this.prev.x, this.prev.y, this.prev.z, dx, dy, dz, len, b)) {
-          return this.explode(false);
+  update(dt: number) {
+    const h = 1 / 120;
+    let n = Math.max(1, Math.round(dt / h));
+    n = Math.min(n, 6);
+    for (let k = this.items.length - 1; k >= 0; k--) {
+      const it = this.items[k];
+      let done = false;
+      for (let s = 0; s < n && !done; s++) {
+        this.prev.copy(it.pos);
+        it.vel.y -= PHYS.gravity * h;
+        it.vel.multiplyScalar(1 - 0.04 * h);
+        it.pos.addScaledVector(it.vel, h);
+        // прямое попадание в цель
+        const t = this.targets.segmentHit(this.prev, it.pos);
+        if (t) {
+          this.finish(it, k, it.pos, t);
+          done = true;
+          break;
+        }
+        // мир (здания, деревья, земля)
+        this.dir.copy(it.pos).sub(this.prev);
+        const len = this.dir.length();
+        if (len > 1e-5) {
+          this.dir.divideScalar(len);
+          const d = this.phys.raycast(this.prev, this.dir, len + 0.05);
+          if (d >= 0) {
+            it.pos.copy(this.prev).addScaledVector(this.dir, d);
+            this.finish(it, k, it.pos, null);
+            done = true;
+            break;
+          }
+        }
+        if (it.pos.y <= terrainHeight(it.pos.x, it.pos.z) + 0.05) {
+          it.pos.y = terrainHeight(it.pos.x, it.pos.z) + 0.1;
+          this.finish(it, k, it.pos, null);
+          done = true;
+          break;
         }
       }
+      if (done) continue;
+      it.age += dt;
+      it.mesh.position.copy(it.pos);
+      this.dir.copy(it.vel).normalize();
+      it.mesh.quaternion.setFromUnitVectors(new Vector3(0, 1, 0), this.dir);
+      if (it.age > 20) {
+        it.mesh.visible = false;
+        this.items.splice(k, 1);
+      }
     }
-    // страховка по времени
-    if (this.pos.y < -5 || Math.abs(this.pos.x) > 400 || Math.abs(this.pos.z) > 400) {
-      return this.explode(false);
-    }
-    return null;
   }
 
-  private explode(onGround: boolean): PayloadDropResult {
-    this.active = false;
-    this.mesh.visible = false;
-    this.rearmT = PAYLOAD.rearmSec;
-    return { point: this.pos.clone(), onGround };
+  private finish(it: Item, idx: number, pos: Vector3, direct: Target | null) {
+    it.mesh.visible = false;
+    this.items.splice(idx, 1);
+    this.onImpact({ pos: pos.clone(), direct });
   }
 
-  /** перезарядка */
-  tick(dt: number): void {
-    if (!this.ready && !this.active) {
-      this.rearmT -= dt;
-      if (this.rearmT <= 0) this.ready = true;
+  /** Прогноз точки падения (для прицельной метки CCIP-стиля) */
+  predict(pos: Vector3, vel: Vector3, out: Vector3): boolean {
+    let x = pos.x,
+      y = pos.y,
+      z = pos.z,
+      vx = vel.x,
+      vy = vel.y,
+      vz = vel.z;
+    const h = 0.05;
+    for (let i = 0; i < 160; i++) {
+      vy -= PHYS.gravity * h;
+      x += vx * h;
+      y += vy * h;
+      z += vz * h;
+      if (y <= terrainHeight(x, z)) {
+        out.set(x, terrainHeight(x, z), z);
+        return true;
+      }
     }
+    return false;
   }
 }

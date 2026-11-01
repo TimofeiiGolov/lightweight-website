@@ -1,130 +1,133 @@
+import type { Settings } from '../config';
+import type { InputManager } from '../core/InputManager';
 import { clamp } from '../utils/MathUtils';
 
-export interface StickValues {
-  x: number; // -1..1
-  y: number; // -1..1 (вверх +)
-}
+/** Один виртуальный стик с поддержкой multitouch (отслеживание pointerId) */
+class Stick {
+  zone = document.createElement('div');
+  base = document.createElement('div');
+  knob = document.createElement('div');
+  x = 0;
+  y = 0;
+  pid: number | null = null;
+  R = 60;
 
-interface StickState {
-  zone: HTMLElement;
-  base: HTMLElement;
-  knob: HTMLElement;
-  pointerId: number | null;
-  cx: number;
-  cy: number;
-  R: number;
-  values: StickValues;
-  sticky: boolean; // throttle: не пружинит к центру
-}
+  constructor(
+    parent: HTMLElement,
+    cls: string,
+    private onMove: (x: number, y: number, active: boolean) => void,
+  ) {
+    this.zone.className = `stick-zone ${cls}`;
+    this.base.className = 'stick-base';
+    this.knob.className = 'stick-knob';
+    this.base.innerHTML = '<i></i><b></b>';
+    this.base.appendChild(this.knob);
+    this.zone.appendChild(this.base);
+    parent.appendChild(this.zone);
 
-/**
- * Два виртуальных стика (Mode 2): левый = газ (вертикаль, без пружины) +
- * рыскание, правый = тангаж + крен. Мультитач через Pointer Events,
- * зона захвата больше видимого стика, визуальная подсветка.
- */
-export class VirtualJoysticks {
-  left: StickState;
-  right: StickState;
-  scale = 1.0;
-  sens = 1.0;
-
-  constructor() {
-    this.left = this.makeStick('stick-zone-left', 'Газ / Рыскание', true);
-    this.right = this.makeStick('stick-zone-right', 'Тангаж / Крен', false);
-  }
-
-  private makeStick(zoneId: string, hint: string, sticky: boolean): StickState {
-    const zone = document.getElementById(zoneId) as HTMLElement;
-    const base = document.createElement('div');
-    base.className = 'stick-base';
-    const knob = document.createElement('div');
-    knob.className = 'stick-knob';
-    base.appendChild(knob);
-    if (hint) {
-      const h = document.createElement('div');
-      h.className = 'stick-hint';
-      h.textContent = hint;
-      base.appendChild(h);
-    }
-    zone.appendChild(base);
-
-    const st: StickState = {
-      zone, base, knob,
-      pointerId: null,
-      cx: 0, cy: 0, R: 60,
-      values: { x: 0, y: 0 },
-      sticky,
-    };
-
-    zone.addEventListener('pointerdown', (e) => {
-      if (st.pointerId !== null) return;
-      st.pointerId = e.pointerId;
-      zone.setPointerCapture(e.pointerId);
-      zone.classList.add('active');
-      this.recenter(st);
-      this.move(st, e.clientX, e.clientY);
+    const z = this.zone;
+    z.addEventListener('pointerdown', (e) => {
+      if (this.pid !== null) return;
+      this.pid = e.pointerId;
+      z.setPointerCapture(e.pointerId);
+      this.base.classList.add('active');
+      this.update(e);
       e.preventDefault();
     });
-    zone.addEventListener('pointermove', (e) => {
-      if (st.pointerId !== e.pointerId) return;
-      this.move(st, e.clientX, e.clientY);
+    z.addEventListener('pointermove', (e) => {
+      if (e.pointerId === this.pid) this.update(e);
     });
-    const release = (e: PointerEvent) => {
-      if (st.pointerId !== e.pointerId) return;
-      st.pointerId = null;
-      zone.classList.remove('active');
-      if (!st.sticky) {
-        st.values.x = 0;
-        st.values.y = 0;
-      }
-      this.render(st);
+    const end = (e: PointerEvent) => {
+      if (e.pointerId !== this.pid) return;
+      this.pid = null;
+      this.base.classList.remove('active');
+      this.onMove(this.x, this.y, false);
     };
-    zone.addEventListener('pointerup', release);
-    zone.addEventListener('pointercancel', release);
-    return st;
+    z.addEventListener('pointerup', end);
+    z.addEventListener('pointercancel', end);
+    z.addEventListener('lostpointercapture', end);
   }
 
-  private recenter(st: StickState): void {
-    const rect = st.base.getBoundingClientRect();
-    st.cx = rect.left + rect.width / 2;
-    st.cy = rect.top + rect.height / 2;
-    st.R = rect.width * 0.4;
-  }
-
-  private move(st: StickState, px: number, py: number): void {
-    let dx = (px - st.cx) / st.R;
-    let dy = -(py - st.cy) / st.R; // вверх = +
-    dx = clamp(dx, -1, 1) * this.sens;
-    dy = clamp(dy, -1, 1) * this.sens;
-    // мёртвая зона в центре
-    const dead = 0.06;
-    const mag = Math.hypot(dx, dy);
-    if (mag < dead) {
-      dx = 0;
-      dy = 0;
-    } else {
-      const k = (mag - dead) / (1 - dead) / mag;
-      dx *= k;
-      dy *= k;
+  private update(e: PointerEvent) {
+    const r = this.base.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    this.R = r.width / 2;
+    let dx = (e.clientX - cx) / this.R;
+    let dy = (e.clientY - cy) / this.R;
+    const m = Math.hypot(dx, dy);
+    if (m > 1) {
+      dx /= m;
+      dy /= m;
     }
-    st.values.x = clamp(dx, -1, 1);
-    st.values.y = clamp(dy, -1, 1);
-    this.render(st);
+    this.x = dx;
+    this.y = -dy;
+    this.onMove(this.x, this.y, true);
   }
 
-  private render(st: StickState): void {
-    const kx = st.values.x * st.R / this.sens;
-    const ky = -st.values.y * st.R / this.sens;
-    st.knob.style.transform = `translate(calc(-50% + ${kx.toFixed(1)}px), calc(-50% + ${ky.toFixed(1)}px))`;
+  /** Установка положения программно (пружина / удержание газа) */
+  setPos(x: number, y: number) {
+    this.x = x;
+    this.y = y;
   }
 
-  applyScale(): void {
-    document.documentElement.style.setProperty('--stick-scale', String(this.scale));
+  draw() {
+    const k = this.R * 0.72;
+    this.knob.style.transform = `translate(${this.x * k}px, ${-this.y * k}px)`;
+  }
+}
+
+export class VirtualJoysticks {
+  root = document.createElement('div');
+  left: Stick;
+  right: Stick;
+
+  constructor(
+    parent: HTMLElement,
+    private input: InputManager,
+    private getSettings: () => Settings,
+  ) {
+    this.root.className = 'sticks';
+    parent.appendChild(this.root);
+    this.left = new Stick(this.root, 'left', (x, y, active) => {
+      input.touch.lx = x;
+      input.touch.leftActive = active;
+      if (getSettings().throttleMode === 'assist' || active) input.touch.ly = active ? y : 0;
+      if (!active) input.touch.lx = 0;
+    });
+    this.right = new Stick(this.root, 'right', (x, y, active) => {
+      input.touch.rx = active ? x : 0;
+      input.touch.ry = active ? y : 0;
+    });
+    this.layout();
+    window.addEventListener('resize', () => this.layout());
   }
 
-  /** Вызывается после ресайза */
-  refreshCenters(): void {
-    this.recenter(this.left);
-    this.recenter(this.right);
+  isTouchDevice() {
+    return 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+  }
+
+  layout() {
+    const s = this.getSettings();
+    const show = s.touchUi === 'on' || (s.touchUi === 'auto' && this.isTouchDevice());
+    this.root.style.display = show ? 'block' : 'none';
+    document.documentElement.dataset.touch = show ? '1' : '0';
+    const size = clamp(Math.min(window.innerWidth, window.innerHeight) * 0.34 * s.stickSize, 90, 240);
+    document.documentElement.style.setProperty('--stick', `${size}px`);
+    document.documentElement.style.setProperty('--stick-margin', `${s.stickMargin}px`);
+    document.documentElement.style.setProperty('--stick-bottom', `${s.stickBottom}px`);
+  }
+
+  /** Вызывается каждый кадр: отрисовка и «пружина» */
+  update() {
+    const s = this.getSettings();
+    const l = this.left;
+    if (l.pid === null) {
+      if (s.throttleMode === 'hold') l.setPos(0, this.input.holdThrottle * 2 - 1);
+      else l.setPos(0, 0);
+    }
+    if (this.right.pid === null) this.right.setPos(0, 0);
+    this.left.draw();
+    this.right.draw();
   }
 }

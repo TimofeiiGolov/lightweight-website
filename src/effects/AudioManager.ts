@@ -1,221 +1,173 @@
-/**
- * Процедурный звук на Web Audio API (без внешних файлов):
- * - моторы: 4 расстроенные пилы + шум, частота/фильтр по газу
- * - ветер: полосовой шум по скорости
- * - события: взрыв, бипы, арм/дисарм, попадание, ворота, победа/провал, клики
- */
+import { clamp } from '../utils/MathUtils';
+
+/** Процедурный звук на Web Audio: моторы, ветер, взрывы, сигналы. Файлы не нужны. */
 export class AudioManager {
   private ctx: AudioContext | null = null;
-  private master: GainNode | null = null;
-  private motorGain: GainNode | null = null;
-  private motorFilter: BiquadFilterNode | null = null;
-  private oscs: OscillatorNode[] = [];
-  private noiseSrc: AudioBufferSourceNode | null = null;
-  private propGain: GainNode | null = null;
-  private propFilter: BiquadFilterNode | null = null;
-  private windGain: GainNode | null = null;
-  private windFilter: BiquadFilterNode | null = null;
-  private noiseBuffer: AudioBuffer | null = null;
-  private volume = 0.8;
-  private started = false;
+  private master!: GainNode;
+  private motorOscs: OscillatorNode[] = [];
+  private motorGain!: GainNode;
+  private motorFilter!: BiquadFilterNode;
+  private windGain!: GainNode;
+  private windFilter!: BiquadFilterNode;
+  private noiseBuf!: AudioBuffer;
+  private volume = 0.6;
 
-  /** Запуск по первому пользовательскому жесту */
-  ensureStarted(): void {
-    if (this.started) return;
-    try {
-      const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new Ctor();
-      const ctx = this.ctx;
-
-      this.master = ctx.createGain();
-      this.master.gain.value = this.volume;
-      this.master.connect(ctx.destination);
-
-      // белый шум (общий буфер)
-      const len = ctx.sampleRate;
-      this.noiseBuffer = ctx.createBuffer(1, len, ctx.sampleRate);
-      const data = this.noiseBuffer.getChannelData(0);
-      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
-
-      // --- моторы ---
-      this.motorFilter = ctx.createBiquadFilter();
-      this.motorFilter.type = 'lowpass';
-      this.motorFilter.frequency.value = 400;
-      this.motorFilter.Q.value = 0.8;
-      this.motorGain = ctx.createGain();
-      this.motorGain.gain.value = 0;
-      this.motorFilter.connect(this.motorGain);
-      this.motorGain.connect(this.master);
-
-      for (let i = 0; i < 4; i++) {
-        const osc = ctx.createOscillator();
-        osc.type = 'sawtooth';
-        osc.frequency.value = 90;
-        osc.detune.value = (i - 1.5) * 7;
-        const g = ctx.createGain();
-        g.gain.value = 0.22;
-        osc.connect(g);
-        g.connect(this.motorFilter);
-        osc.start();
-        this.oscs.push(osc);
-      }
-
-      // шум пропеллеров
-      this.propFilter = ctx.createBiquadFilter();
-      this.propFilter.type = 'bandpass';
-      this.propFilter.frequency.value = 900;
-      this.propFilter.Q.value = 1.2;
-      this.propGain = ctx.createGain();
-      this.propGain.gain.value = 0;
-      this.propFilter.connect(this.propGain);
-      this.propGain.connect(this.master);
-      this.noiseSrc = ctx.createBufferSource();
-      this.noiseSrc.buffer = this.noiseBuffer;
-      this.noiseSrc.loop = true;
-      this.noiseSrc.connect(this.propFilter);
-      this.noiseSrc.start();
-
-      // --- ветер ---
-      this.windFilter = ctx.createBiquadFilter();
-      this.windFilter.type = 'bandpass';
-      this.windFilter.frequency.value = 500;
-      this.windFilter.Q.value = 0.5;
-      this.windGain = ctx.createGain();
-      this.windGain.gain.value = 0;
-      this.windFilter.connect(this.windGain);
-      this.windGain.connect(this.master);
-      const windSrc = ctx.createBufferSource();
-      windSrc.buffer = this.noiseBuffer;
-      windSrc.loop = true;
-      windSrc.connect(this.windFilter);
-      windSrc.start();
-
-      this.started = true;
-    } catch (e) {
-      console.warn('[Audio] не удалось инициализировать', e);
-    }
-  }
-
-  resume(): void {
-    if (this.ctx && this.ctx.state === 'suspended') {
+  /** Нужно вызывать из пользовательского жеста (тап по кнопке) */
+  start() {
+    if (this.ctx) {
       void this.ctx.resume();
+      return;
     }
+    const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    this.ctx = ctx;
+    this.master = ctx.createGain();
+    this.master.gain.value = this.volume;
+    this.master.connect(ctx.destination);
+
+    this.motorGain = ctx.createGain();
+    this.motorGain.gain.value = 0;
+    this.motorFilter = ctx.createBiquadFilter();
+    this.motorFilter.type = 'lowpass';
+    this.motorFilter.frequency.value = 1400;
+    this.motorFilter.connect(this.motorGain).connect(this.master);
+    for (let i = 0; i < 4; i++) {
+      const o = ctx.createOscillator();
+      o.type = i % 2 ? 'sawtooth' : 'square';
+      o.frequency.value = 100;
+      const g = ctx.createGain();
+      g.gain.value = 0.25;
+      o.connect(g).connect(this.motorFilter);
+      o.start();
+      this.motorOscs.push(o);
+    }
+
+    const len = ctx.sampleRate * 2;
+    this.noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = this.noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    const wind = ctx.createBufferSource();
+    wind.buffer = this.noiseBuf;
+    wind.loop = true;
+    this.windFilter = ctx.createBiquadFilter();
+    this.windFilter.type = 'bandpass';
+    this.windFilter.frequency.value = 500;
+    this.windFilter.Q.value = 0.6;
+    this.windGain = ctx.createGain();
+    this.windGain.gain.value = 0;
+    wind.connect(this.windFilter).connect(this.windGain).connect(this.master);
+    wind.start();
   }
 
-  setVolume(v: number): void {
+  setVolume(v: number) {
     this.volume = v;
     if (this.master) this.master.gain.value = v;
   }
 
-  /** Обновление моторов/ветра каждый кадр */
-  update(armed: boolean, spool: number, speed: number, yawInput: number): void {
-    if (!this.started || !this.ctx) return;
+  /** Каждый кадр */
+  update(motors: Float32Array, armed: boolean, speed: number) {
+    if (!this.ctx) return;
     const t = this.ctx.currentTime;
-    const base = 78 + 250 * spool;
-    for (let i = 0; i < this.oscs.length; i++) {
-      const diff = (i % 2 === 0 ? 1 : -1) * yawInput * 14;
-      this.oscs[i].frequency.setTargetAtTime(base + diff + i * 2, t, 0.04);
+    let avg = 0;
+    for (let i = 0; i < 4; i++) {
+      avg += motors[i];
+      this.motorOscs[i].frequency.setTargetAtTime(70 + motors[i] * 520 + i * 3, t, 0.03);
     }
-    this.motorFilter?.frequency.setTargetAtTime(240 + 2300 * spool, t, 0.05);
-    this.motorGain?.gain.setTargetAtTime(armed ? 0.045 + 0.16 * spool : 0, t, 0.06);
-    this.propFilter?.frequency.setTargetAtTime(600 + 900 * spool, t, 0.05);
-    this.propGain?.gain.setTargetAtTime(armed ? 0.02 + 0.1 * spool : 0, t, 0.06);
-    this.windFilter?.frequency.setTargetAtTime(300 + speed * 26, t, 0.1);
-    this.windGain?.gain.setTargetAtTime(Math.min(0.28, speed * 0.011), t, 0.12);
+    avg /= 4;
+    const on = armed || avg > 0.02;
+    this.motorGain.gain.setTargetAtTime(on ? 0.05 + avg * 0.14 : 0, t, 0.08);
+    this.motorFilter.frequency.setTargetAtTime(500 + avg * 2500, t, 0.05);
+    const w = clamp(speed / 28, 0, 1);
+    this.windGain.gain.setTargetAtTime(w * w * 0.35, t, 0.1);
+    this.windFilter.frequency.setTargetAtTime(300 + w * 1400, t, 0.1);
   }
 
-  private beep(freq: number, dur: number, type: OscillatorType = 'sine', gain = 0.14, when = 0): void {
-    if (!this.started || !this.ctx || !this.master) return;
-    const ctx = this.ctx;
-    const t = ctx.currentTime + when;
-    const osc = ctx.createOscillator();
-    osc.type = type;
-    osc.frequency.value = freq;
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(gain, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    osc.connect(g);
-    g.connect(this.master);
-    osc.start(t);
-    osc.stop(t + dur + 0.02);
+  silenceMotors() {
+    if (this.ctx) this.motorGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.05);
   }
 
-  click(): void {
-    this.beep(1900, 0.035, 'square', 0.05);
+  beep(freq = 880, dur = 0.12, vol = 0.2, type: OscillatorType = 'sine') {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    o.type = type;
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(this.master);
+    o.start(t);
+    o.stop(t + dur + 0.02);
   }
 
-  arm(): void {
-    this.beep(1100, 0.09, 'square', 0.1);
-    this.beep(1500, 0.12, 'square', 0.1, 0.12);
+  arm(on: boolean) {
+    this.beep(on ? 1200 : 600, 0.1, 0.18, 'square');
+    if (on) setTimeout(() => this.beep(1600, 0.1, 0.18, 'square'), 120);
   }
 
-  disarm(): void {
-    this.beep(880, 0.16, 'square', 0.09);
+  gate() {
+    this.beep(1040, 0.08, 0.2);
+    setTimeout(() => this.beep(1560, 0.12, 0.2), 80);
   }
 
-  gate(): void {
-    this.beep(1350, 0.08, 'sine', 0.12);
-    this.beep(1800, 0.1, 'sine', 0.1, 0.07);
+  warn() {
+    this.beep(520, 0.15, 0.2, 'square');
   }
 
-  hit(): void {
-    this.beep(2100, 0.05, 'square', 0.12);
-    this.beep(1500, 0.07, 'square', 0.09, 0.04);
+  drop() {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(900, t);
+    o.frequency.exponentialRampToValueAtTime(200, t + 0.25);
+    g.gain.setValueAtTime(0.12, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+    o.connect(g).connect(this.master);
+    o.start(t);
+    o.stop(t + 0.35);
   }
 
-  lowBattery(): void {
-    this.beep(700, 0.12, 'square', 0.1);
-  }
-
-  explosion(): void {
-    if (!this.started || !this.ctx || !this.master || !this.noiseBuffer) return;
-    const ctx = this.ctx;
-    const t = ctx.currentTime;
-    // шумовой удар
-    const src = ctx.createBufferSource();
-    src.buffer = this.noiseBuffer;
-    const f = ctx.createBiquadFilter();
+  private noiseBurst(dur: number, f0: number, f1: number, vol: number) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const s = this.ctx.createBufferSource();
+    s.buffer = this.noiseBuf;
+    const f = this.ctx.createBiquadFilter();
     f.type = 'lowpass';
-    f.frequency.setValueAtTime(3200, t);
-    f.frequency.exponentialRampToValueAtTime(120, t + 0.7);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.6, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.85);
-    src.connect(f);
-    f.connect(g);
-    g.connect(this.master);
-    src.start(t);
-    src.stop(t + 0.9);
-    // низкий «бум»
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(62, t);
-    osc.frequency.exponentialRampToValueAtTime(28, t + 0.5);
-    const og = ctx.createGain();
-    og.gain.setValueAtTime(0.5, t);
-    og.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
-    osc.connect(og);
-    og.connect(this.master);
-    osc.start(t);
-    osc.stop(t + 0.6);
+    f.frequency.setValueAtTime(f0, t);
+    f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f).connect(g).connect(this.master);
+    s.start(t);
+    s.stop(t + dur + 0.05);
   }
 
-  crash(): void {
-    this.explosion();
+  explosion(distance: number) {
+    if (!this.ctx) return;
+    const vol = clamp(1.1 - distance / 250, 0.15, 1);
+    this.noiseBurst(1.6, 2000, 60, vol);
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    o.frequency.setValueAtTime(90, t);
+    o.frequency.exponentialRampToValueAtTime(28, t + 0.7);
+    g.gain.setValueAtTime(vol * 0.9, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.9);
+    o.connect(g).connect(this.master);
+    o.start(t);
+    o.stop(t + 1);
   }
 
-  win(): void {
-    const notes = [880, 1100, 1320, 1760];
-    notes.forEach((n, i) => this.beep(n, 0.16, 'sine', 0.12, i * 0.13));
+  crash(power = 1) {
+    this.noiseBurst(0.35 + power * 0.2, 1800, 200, clamp(0.3 + power * 0.3, 0.2, 0.9));
   }
 
-  fail(): void {
-    const notes = [420, 320, 240];
-    notes.forEach((n, i) => this.beep(n, 0.2, 'sawtooth', 0.08, i * 0.16));
-  }
-
-  drop(): void {
-    this.beep(500, 0.1, 'triangle', 0.12);
-    this.beep(350, 0.14, 'triangle', 0.1, 0.08);
+  bump() {
+    this.noiseBurst(0.12, 1500, 300, 0.25);
   }
 }

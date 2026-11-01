@@ -1,97 +1,68 @@
-import type { RecordEntry, Settings } from '../types';
+import { DEFAULT_SETTINGS, type Settings } from '../config';
 
-const SETTINGS_KEY = 'fpvpolygon.settings.v1';
-const RECORDS_KEY = 'fpvpolygon.records.v1';
+const KEY_SETTINGS = 'fpv-sim/settings/v1';
+const KEY_RECORDS = 'fpv-sim/records/v1';
 
-export const DEFAULT_SETTINGS: Settings = {
-  rcRate: 1.0,
-  superRate: 0.7,
-  expo: 0.2,
-  stickSens: 1.0,
-  maxThrottle: 100,
-  camTilt: 25,
-  fov: 110,
-  twr: 3.2,
-  massKg: 0.68,
-  quality: 'auto',
-  lighting: 'day',
-  shake: 0.6,
-  volume: 0.8,
-  osdStyle: 'analog',
-  showFps: false,
-  stickScale: 1.0,
-};
-
-function hasLS(): boolean {
-  try {
-    return typeof localStorage !== 'undefined';
-  } catch {
-    return false;
-  }
+export interface MissionRecord {
+  stars: number;
+  bestScore: number;
+  bestTime: number; // сек, 0 — нет
+  attempts: number;
 }
+
+function deepMerge<T>(base: T, over: unknown): T {
+  if (typeof base !== 'object' || base === null || typeof over !== 'object' || over === null) {
+    return (over === undefined ? base : (over as T)) ?? base;
+  }
+  const out: Record2 = { ...(base as Record2) };
+  for (const k of Object.keys(base as Record2)) {
+    const ov = (over as Record2)[k];
+    if (ov !== undefined) out[k] = deepMerge((base as Record2)[k], ov);
+  }
+  return out as T;
+}
+type Record2 = { [k: string]: unknown };
 
 export function loadSettings(): Settings {
-  if (!hasLS()) return { ...DEFAULT_SETTINGS };
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
-    const parsed = JSON.parse(raw) as Partial<Settings>;
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    const raw = localStorage.getItem(KEY_SETTINGS);
+    if (!raw) return structuredClone(DEFAULT_SETTINGS);
+    return deepMerge(structuredClone(DEFAULT_SETTINGS), JSON.parse(raw));
   } catch {
-    return { ...DEFAULT_SETTINGS };
+    return structuredClone(DEFAULT_SETTINGS);
   }
 }
 
-export function saveSettings(s: Settings): void {
-  if (!hasLS()) return;
+export function saveSettings(s: Settings) {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+    localStorage.setItem(KEY_SETTINGS, JSON.stringify(s));
   } catch {
     /* приватный режим — игнорируем */
   }
 }
 
-export function loadRecords(): Record<string, RecordEntry> {
-  if (!hasLS()) return {};
+export function loadRecords(): { [id: string]: MissionRecord } {
   try {
-    const raw = localStorage.getItem(RECORDS_KEY);
-    if (!raw) return {};
-    return JSON.parse(raw) as Record<string, RecordEntry>;
+    return JSON.parse(localStorage.getItem(KEY_RECORDS) || '{}');
   } catch {
     return {};
   }
 }
 
-export function saveRecord(id: string, entry: RecordEntry): Record<string, RecordEntry> {
+export function submitRecord(id: string, stars: number, score: number, time: number, success: boolean): MissionRecord {
   const all = loadRecords();
-  const prev = all[id];
-  if (!prev ||
-      entry.stars > prev.stars ||
-      entry.bestScore > prev.bestScore ||
-      (entry.bestTime > 0 && (prev.bestTime === 0 || entry.bestTime < prev.bestTime))) {
-    all[id] = {
-      stars: Math.max(entry.stars, prev?.stars ?? 0),
-      bestScore: Math.max(entry.bestScore, prev?.bestScore ?? 0),
-      bestTime: entry.bestTime > 0
-        ? (prev?.bestTime ? Math.min(entry.bestTime, prev.bestTime) : entry.bestTime)
-        : (prev?.bestTime ?? 0),
-    };
-    if (hasLS()) {
-      try {
-        localStorage.setItem(RECORDS_KEY, JSON.stringify(all));
-      } catch {
-        /* ignore */
-      }
-    }
+  const r = all[id] ?? { stars: 0, bestScore: 0, bestTime: 0, attempts: 0 };
+  r.attempts++;
+  if (success) {
+    r.stars = Math.max(r.stars, stars);
+    r.bestTime = r.bestTime === 0 ? time : Math.min(r.bestTime, time);
   }
-  return all;
-}
-
-export function clearRecords(): void {
-  if (!hasLS()) return;
+  r.bestScore = Math.max(r.bestScore, score);
+  all[id] = r;
   try {
-    localStorage.removeItem(RECORDS_KEY);
+    localStorage.setItem(KEY_RECORDS, JSON.stringify(all));
   } catch {
     /* ignore */
   }
+  return r;
 }

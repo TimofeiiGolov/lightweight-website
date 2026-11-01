@@ -1,36 +1,29 @@
-/** Простой типизированный EventBus */
-type Handler = (...args: unknown[]) => void;
+// Минимальная типизированная шина событий
 
-export class EventBus {
-  private map = new Map<string, Set<Handler>>();
+type Handler<T> = (payload: T) => void;
 
-  on(event: string, fn: Handler): () => void {
-    let set = this.map.get(event);
-    if (!set) {
-      set = new Set();
-      this.map.set(event, set);
-    }
-    set.add(fn);
-    return () => this.off(event, fn);
+export class EventBus<Events extends { [k: string]: unknown }> {
+  private map = new Map<keyof Events, Set<Handler<never>>>();
+
+  on<K extends keyof Events>(name: K, fn: Handler<Events[K]>): () => void {
+    let set = this.map.get(name);
+    if (!set) this.map.set(name, (set = new Set()));
+    set.add(fn as Handler<never>);
+    return () => set!.delete(fn as Handler<never>);
   }
 
-  off(event: string, fn: Handler): void {
-    this.map.get(event)?.delete(fn);
-  }
-
-  emit(event: string, ...args: unknown[]): void {
-    const set = this.map.get(event);
-    if (!set) return;
-    for (const fn of [...set]) {
-      try {
-        fn(...args);
-      } catch (e) {
-        console.error(`[EventBus] handler error on "${event}"`, e);
-      }
-    }
-  }
-
-  clear(): void {
-    this.map.clear();
+  emit<K extends keyof Events>(name: K, payload: Events[K]) {
+    this.map.get(name)?.forEach((fn) => (fn as Handler<Events[K]>)(payload));
   }
 }
+
+/** События игрового ввода (кнопки) */
+export type InputEvents = {
+  arm: void;
+  reset: void;
+  drop: void;
+  tilt: number; // +1 / -1
+  pause: void;
+  camera: void;
+  mode: void;
+};

@@ -1,192 +1,184 @@
-import type { FlightInput } from '../types';
-import { VirtualJoysticks } from '../ui/VirtualJoysticks';
-import { clamp } from '../utils/MathUtils';
+import type { Settings } from '../config';
+import { clamp, damp } from '../utils/MathUtils';
+import { EventBus, type InputEvents } from './EventBus';
 
-export interface InputEvents {
-  onArmToggle: () => void;
-  onReset: () => void;
-  onDrop: () => void;
-  onTilt: (delta: number) => void;
-  onPause: () => void;
+export interface Controls {
+  roll: number; // -1..1 (+ вправо)
+  pitch: number; // -1..1 (+ вперёд/нос вниз)
+  yaw: number; // -1..1 (+ вправо)
+  /** -1..1. В режиме hold: позиция стика газа (-1 — ноль), в assist: пружинящий стик */
+  throttleStick: number;
 }
 
-/**
- * Агрегатор ввода: виртуальные стики + клавиатура + мышь + Gamepad API.
- * Итоговая команда — сумма источников с ограничением.
- */
+/** Объединяет виртуальные стики, клавиатуру и Gamepad API (радиоаппаратура в режиме USB Joystick) */
 export class InputManager {
-  sticks: VirtualJoysticks;
-  /** дрожание сигнала (SIGNAL LOST) */
-  jitter = 0;
+  bus = new EventBus<InputEvents>();
+
+  // Значения виртуальных стиков (пишет VirtualJoysticks)
+  touch = { lx: 0, ly: 0, rx: 0, ry: 0, leftActive: false };
+  /** Постоянное положение газа 0..1 для режима hold */
+  holdThrottle = 0;
+
+  padName = '';
+  padActive = false;
 
   private keys = new Set<string>();
-  private keyThrottle = 0;
-  private mouseSteer = false;
-  private mouseVX = 0;
-  private mouseVY = 0;
-  private gamepadPrev = new Set<number>();
-  private events: InputEvents;
-  private tiltHoldTimer: ReturnType<typeof setInterval> | null = null;
+  private kb = { roll: 0, pitch: 0, yaw: 0, thr: 0 };
+  private prevButtons: boolean[] = [];
+  private prevAux = [false, false];
+  private out: Controls = { roll: 0, pitch: 0, yaw: 0, throttleStick: -1 };
 
-  constructor(events: InputEvents) {
-    this.events = events;
-    this.sticks = new VirtualJoysticks();
-    this.bindKeyboard();
-    this.bindMouse();
-  }
-
-  private bindKeyboard(): void {
-    window.addEventListener('keydown', (e) => {
-      if (e.repeat) return;
-      this.keys.add(e.code);
-      switch (e.code) {
-        case 'Space':
-          this.events.onArmToggle();
-          e.preventDefault();
-          break;
-        case 'KeyR':
-          this.events.onReset();
-          break;
-        case 'KeyF':
-          this.events.onDrop();
-          break;
-        case 'KeyQ':
-          this.events.onTilt(-5);
-          break;
-        case 'KeyE':
-          this.events.onTilt(5);
-          break;
-        case 'KeyP':
-        case 'Escape':
-          this.events.onPause();
-          break;
-      }
-    });
+  constructor(private getSettings: () => Settings) {
+    window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
     window.addEventListener('blur', () => this.keys.clear());
   }
 
-  private bindMouse(): void {
-    const canvas = document.getElementById('app');
-    if (!canvas) return;
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-    canvas.addEventListener('pointerdown', (e) => {
-      if (e.pointerType === 'mouse' && e.button === 0) {
-        this.mouseSteer = true;
-      }
-    });
-    window.addEventListener('pointerup', (e) => {
-      if (e.pointerType === 'mouse') {
-        this.mouseSteer = false;
-        this.mouseVX = 0;
-        this.mouseVY = 0;
-      }
-    });
-    window.addEventListener('mousemove', (e) => {
-      if (!this.mouseSteer) return;
-      this.mouseVX = clamp(this.mouseVX + e.movementX * 0.012, -1, 1);
-      this.mouseVY = clamp(this.mouseVY - e.movementY * 0.012, -1, 1);
-    });
-  }
-
-  /** Удержание кнопок наклона камеры (HUD) */
-  bindHoldButton(btn: HTMLElement, delta: number): void {
-    const start = (e: Event) => {
-      e.preventDefault();
-      this.events.onTilt(delta);
-      this.tiltHoldTimer = setInterval(() => this.events.onTilt(delta), 180);
-    };
-    const stop = () => {
-      if (this.tiltHoldTimer) {
-        clearInterval(this.tiltHoldTimer);
-        this.tiltHoldTimer = null;
-      }
-    };
-    btn.addEventListener('pointerdown', start);
-    btn.addEventListener('pointerup', stop);
-    btn.addEventListener('pointercancel', stop);
-    btn.addEventListener('pointerleave', stop);
-  }
-
-  update(dt: number): void {
-    // клавиатура: газ — виртуальный ползунок
-    const rate = 0.9 * dt;
-    if (this.keys.has('KeyW')) this.keyThrottle = clamp(this.keyThrottle + rate, 0, 1);
-    if (this.keys.has('KeyS')) this.keyThrottle = clamp(this.keyThrottle - rate, 0, 1);
-  }
-
-  /** Опрос геймпада + события кнопок */
-  pollGamepad(): void {
-    const pads = navigator.getGamepads?.() ?? [];
-    let padIdx = 0;
-    for (const pad of pads) {
-      if (!pad) continue;
-      const dz = (v: number) => (Math.abs(v) < 0.08 ? 0 : v);
-      // Mode 2: левый стик — газ/рыскание, правый — тангаж/крен
-      this.padThrottle = pad.axes[1] !== undefined ? clamp(-pad.axes[1], 0, 1) : 0;
-      this.padYaw = dz(pad.axes[0] ?? 0);
-      this.padPitch = dz(pad.axes[3] ?? 0);
-      this.padRoll = dz(pad.axes[2] ?? 0);
-
-      const justPressed = (idx: number): boolean => {
-        const pressed = pad.buttons[idx]?.pressed ?? false;
-        const key = padIdx * 32 + idx;
-        const was = this.gamepadPrev.has(key);
-        if (pressed) this.gamepadPrev.add(key);
-        else this.gamepadPrev.delete(key);
-        return pressed && !was;
-      };
-      if (justPressed(0)) this.events.onArmToggle();     // A
-      if (justPressed(1)) this.events.onDrop();          // B
-      if (justPressed(2)) this.events.onReset();         // X
-      if (justPressed(3)) this.events.onTilt(5);         // Y
-      if (justPressed(4)) this.events.onTilt(-5);        // LB
-      if (justPressed(9)) this.events.onPause();         // Start
-      padIdx++;
+  private onKeyDown = (e: KeyboardEvent) => {
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT')) return;
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+    this.keys.add(e.code);
+    if (e.repeat) return;
+    switch (e.code) {
+      case 'Space':
+      case 'KeyG':
+        this.bus.emit('arm', undefined);
+        break;
+      case 'KeyR':
+        this.bus.emit('reset', undefined);
+        break;
+      case 'KeyF':
+      case 'Enter':
+        this.bus.emit('drop', undefined);
+        break;
+      case 'KeyE':
+        this.bus.emit('tilt', 1);
+        break;
+      case 'KeyQ':
+        this.bus.emit('tilt', -1);
+        break;
+      case 'Escape':
+      case 'KeyP':
+        this.bus.emit('pause', undefined);
+        break;
+      case 'KeyV':
+        this.bus.emit('camera', undefined);
+        break;
+      case 'KeyM':
+        this.bus.emit('mode', undefined);
+        break;
     }
+  };
+
+  private axis(neg: string[], pos: string[]): number {
+    let v = 0;
+    for (const k of pos) if (this.keys.has(k)) v += 1;
+    for (const k of neg) if (this.keys.has(k)) v -= 1;
+    return v;
   }
 
-  private padThrottle = 0;
-  private padYaw = 0;
-  private padPitch = 0;
-  private padRoll = 0;
-
-  /** Итоговая команда для модели полёта */
-  getCommand(sens: number): FlightInput {
-    const j = () => (Math.random() - 0.5) * this.jitter;
-    const merge = (a: number, b: number, c = 0) =>
-      clamp(a + b + c + j(), -1, 1);
-
-    const L = this.sticks.left.values;
-    const R = this.sticks.right.values;
-
-    const throttle = clamp(
-      Math.max(L.y > 0 ? L.y : 0, this.keyThrottle, this.padThrottle) * sens,
-      0, 1
-    );
-
-    return {
-      throttle,
-      yaw: merge(L.x, this.padYaw),
-      pitch: merge(-R.y * sens, this.padPitch, this.mouseVY * sens),
-      roll: merge(R.x * sens, this.padRoll, this.mouseVX * sens),
-    };
+  private dz(v: number, dz: number, sens: number): number {
+    const a = Math.abs(v);
+    if (a < dz) return 0;
+    return clamp(Math.sign(v) * ((a - dz) / (1 - dz)) * sens, -1, 1);
   }
 
-  resetThrottle(): void {
-    this.keyThrottle = 0;
+  resetThrottle() {
+    this.holdThrottle = 0;
+    this.kb.thr = 0;
   }
 
-  resetSticks(): void {
-    this.sticks.left.values.x = 0;
-    this.sticks.left.values.y = 0;
-    this.sticks.right.values.x = 0;
-    this.sticks.right.values.y = 0;
-    this.mouseVX = 0;
-    this.mouseVY = 0;
-    this.padThrottle = 0;
-    this.padYaw = 0;
-    this.padPitch = 0;
-    this.padRoll = 0;
+  /** Вызывается раз за кадр */
+  sample(dt: number): Controls {
+    const s = this.getSettings();
+
+    // --- клавиатура с плавным нарастанием (имитация аналоговых стиков) ---
+    const kRoll = this.axis(['ArrowLeft'], ['ArrowRight']);
+    const kPitch = this.axis(['ArrowDown'], ['ArrowUp']);
+    const kYaw = this.axis(['KeyA'], ['KeyD']);
+    const kThr = this.axis(['KeyS'], ['KeyW']);
+    const slew = (cur: number, target: number) => damp(cur, target, target === 0 ? 14 : 7, dt);
+    this.kb.roll = slew(this.kb.roll, kRoll);
+    this.kb.pitch = slew(this.kb.pitch, kPitch);
+    this.kb.yaw = slew(this.kb.yaw, kYaw);
+
+    // --- геймпад / радио ---
+    let gRoll = 0,
+      gPitch = 0,
+      gYaw = 0,
+      gThr = 0;
+    let padThrAbs: number | null = null;
+    this.padActive = false;
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (const p of pads) {
+      if (!p || !p.connected) continue;
+      this.padName = p.id;
+      this.padActive = true;
+      const a = p.axes;
+      const g = (i: number) => a[i] ?? 0;
+      if (s.padMap === 'standard') {
+        gYaw = g(0);
+        gThr = -g(1);
+        gRoll = g(2);
+        gPitch = -g(3);
+      } else if (s.padMap === 'aetr') {
+        gRoll = g(0);
+        gPitch = -g(1);
+        padThrAbs = (g(2) + 1) / 2;
+        gYaw = g(3);
+      } else {
+        padThrAbs = (g(0) + 1) / 2; // TAER
+        gRoll = g(1);
+        gPitch = -g(2);
+        gYaw = g(3);
+      }
+      // кнопки (edge)
+      const b = p.buttons.map((x) => x.pressed);
+      const edge = (i: number) => !!b[i] && !this.prevButtons[i];
+      if (edge(0)) this.bus.emit('arm', undefined);
+      if (edge(1) || edge(5)) this.bus.emit('drop', undefined);
+      if (edge(2)) this.bus.emit('reset', undefined);
+      if (edge(3)) this.bus.emit('camera', undefined);
+      if (edge(9)) this.bus.emit('pause', undefined);
+      if (edge(12)) this.bus.emit('tilt', 1);
+      if (edge(13)) this.bus.emit('tilt', -1);
+      if (edge(4)) this.bus.emit('mode', undefined);
+      this.prevButtons = b;
+      // тумблеры радио на AUX-каналах
+      if (s.padMap !== 'standard') {
+        const aux = [g(4) > 0.5, g(5) > 0.5];
+        if (aux[0] !== this.prevAux[0]) this.bus.emit('arm', undefined);
+        if (aux[1] && !this.prevAux[1]) this.bus.emit('drop', undefined);
+        this.prevAux = aux;
+      }
+      break;
+    }
+
+    // --- газ ---
+    const hold = s.throttleMode === 'hold';
+    let thrStick: number;
+    if (hold) {
+      if (this.touch.leftActive) this.holdThrottle = (this.touch.ly + 1) / 2;
+      else if (padThrAbs !== null) this.holdThrottle = padThrAbs;
+      else {
+        this.holdThrottle = clamp(this.holdThrottle + (kThr * 0.55 + (Math.abs(gThr) > 0.1 ? gThr * 0.8 : 0)) * dt, 0, 1);
+      }
+      thrStick = this.holdThrottle * 2 - 1;
+    } else {
+      this.kb.thr = slew(this.kb.thr, kThr);
+      let t = this.kb.thr + this.touch.ly + gThr;
+      if (padThrAbs !== null) t += padThrAbs * 2 - 1;
+      thrStick = clamp(t, -1, 1);
+      this.holdThrottle = (thrStick + 1) / 2; // для отображения
+    }
+
+    const dzv = s.deadzone;
+    const sens = s.stickSens;
+    this.out.roll = this.dz(this.kb.roll + this.touch.rx + gRoll, dzv, sens);
+    this.out.pitch = this.dz(this.kb.pitch + this.touch.ry + gPitch, dzv, sens);
+    this.out.yaw = this.dz(this.kb.yaw + this.touch.lx + gYaw, dzv, sens);
+    this.out.throttleStick = thrStick;
+    return this.out;
   }
 }

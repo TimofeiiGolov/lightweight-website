@@ -1,156 +1,153 @@
-import * as THREE from 'three';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
-import type { Quality } from '../types';
+import {
+  BufferGeometry,
+  Camera,
+  Float32BufferAttribute,
+  HalfFloatType,
+  LinearFilter,
+  Mesh,
+  OrthographicCamera,
+  Scene,
+  ShaderMaterial,
+  UnsignedByteType,
+  WebGLRenderTarget,
+  type WebGLRenderer,
+} from 'three';
 
-/**
- * Пост-обработка FPV: один кастомный шейдер
- * (виньетка + зерно + скан-линии + шум сигнала + хроматическая аберрация
- * + катящаяся полоса помех), опциональный bloom на desktop/high.
- */
-const FPVShader = {
-  uniforms: {
-    tDiffuse: { value: null as THREE.Texture | null },
-    uTime: { value: 0 },
-    uNoise: { value: 0 },      // 0..1 помехи
-    uVignette: { value: 0.55 },
-    uGrain: { value: 0.06 },
-    uScan: { value: 0.12 },
-    uAberration: { value: 0.0022 },
-    uBand: { value: 0 },       // катящаяся полоса
-    uAnalog: { value: 1 },
-  },
-  vertexShader: /* glsl */ `
-    varying vec2 vUv;
-    void main() {
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }
-  `,
-  fragmentShader: /* glsl */ `
-    uniform sampler2D tDiffuse;
-    uniform float uTime;
-    uniform float uNoise;
-    uniform float uVignette;
-    uniform float uGrain;
-    uniform float uScan;
-    uniform float uAberration;
-    uniform float uBand;
-    uniform float uAnalog;
-    varying vec2 vUv;
+export interface FxParams {
+  noise: number; // снег при потере сигнала 0..1
+  glitch: number; // горизонтальные полосы 0..1
+  vignette: number;
+  chroma: number;
+  grain: number;
+  scan: number;
+  gain: number;
+  sat: number;
+  analog: number; // 0 цифра / 1 аналог
+  flash: number;
+}
 
-    float hash(vec2 p) {
-      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
-    }
+const FRAG = /* glsl */ `
+precision highp float;
+uniform sampler2D tDiffuse;
+uniform vec2 uRes;
+uniform float uTime, uNoise, uGlitch, uVignette, uChroma, uGrain, uScan, uGain, uSat, uAnalog, uFlash;
+varying vec2 vUv;
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
+void main(){
+  vec2 uv = vUv;
+  // горизонтальные полосы помех
+  float row = floor(uv.y * 70.0);
+  float r = hash(vec2(row, floor(uTime * 14.0)));
+  float tear = step(1.0 - uGlitch * 0.45, r) * (r - 0.5) * 0.25 * uGlitch;
+  uv.x += tear + sin(uv.y * 9.0 + uTime * 25.0) * 0.006 * uGlitch * uGlitch;
+  vec2 c = uv - 0.5;
+  float amt = uChroma * (0.0012 + dot(c, c) * 0.014);
+  vec3 col;
+  col.r = texture2D(tDiffuse, uv + c * amt * 1.5).r;
+  col.g = texture2D(tDiffuse, uv).g;
+  col.b = texture2D(tDiffuse, uv - c * amt * 1.5).b;
+  if (uAnalog > 0.01) {
+    vec2 px = vec2(1.6 / uRes.x, 0.0);
+    vec3 bl = 0.5 * (texture2D(tDiffuse, uv + px).rgb + texture2D(tDiffuse, uv - px).rgb);
+    col = mix(col, bl, 0.45 * uAnalog);
+  }
+  col *= uGain;
+  col = aces(col);
+  float l = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(l), col, uSat);
+  if (uAnalog > 0.01) {
+    col *= 1.0 - uScan * uAnalog * 0.14 * (0.5 + 0.5 * sin(uv.y * uRes.y * 1.5708));
+    col *= vec3(1.0, 1.02, 0.97);
+  }
+  float n = hash(uv * uRes + fract(uTime) * 91.7);
+  col += (n - 0.5) * uGrain;
+  col = mix(col, vec3(hash(uv * uRes * 0.5 + uTime) * 0.8 + 0.1), clamp(uNoise, 0.0, 1.0));
+  float v = smoothstep(0.95, 0.3, length(c) * 1.25);
+  col *= mix(1.0, v, uVignette);
+  col = mix(col, vec3(1.0), uFlash);
+  gl_FragColor = vec4(col, 1.0);
+  #include <colorspace_fragment>
+}`;
 
-    void main() {
-      vec2 uv = vUv;
-      vec2 center = uv - 0.5;
-      float dist = length(center);
-
-      // хроматическая аберрация к краям
-      float ab = uAberration * (1.0 + dist * 4.0) + uNoise * 0.004;
-      float r = texture2D(tDiffuse, uv + center * ab).r;
-      float g = texture2D(tDiffuse, uv).g;
-      float b = texture2D(tDiffuse, uv - center * ab).b;
-      vec3 col = vec3(r, g, b);
-
-      // скан-линии (сильнее в аналоговом режиме)
-      float scanAmt = uScan * mix(0.4, 1.0, uAnalog);
-      float scan = sin(uv.y * 900.0) * 0.5 + 0.5;
-      col *= 1.0 - scanAmt * scan * 0.5;
-
-      // катящаяся полоса помех
-      if (uBand > 0.001) {
-        float bandY = fract(uTime * 0.13);
-        float band = smoothstep(0.12, 0.0, abs(uv.y - bandY)) * uBand;
-        col += band * 0.35;
-        col = mix(col, vec3(0.8, 0.85, 0.8), band * 0.25);
-      }
-
-      // статический шум сигнала
-      if (uNoise > 0.001) {
-        float n = hash(uv * vec2(1000.0, 700.0) + fract(uTime) * 100.0);
-        col = mix(col, vec3(n), clamp(uNoise, 0.0, 0.92));
-      }
-
-      // зерно
-      float grain = (hash(uv * 800.0 + fract(uTime * 7.0)) - 0.5) * uGrain * (1.0 + uNoise * 2.0);
-      col += grain;
-
-      // виньетка
-      float vig = smoothstep(0.85, 0.35, dist * (1.0 + uVignette));
-      col *= mix(1.0, vig, uVignette + 0.25);
-
-      gl_FragColor = vec4(col, 1.0);
-    }
-  `,
-};
-
+/** Рендер сцены в RT и один полноэкранный проход с FPV-эффектами */
 export class PostProcessing {
-  private composer: EffectComposer;
-  private fpvPass: ShaderPass;
-  private bloom: UnrealBloomPass;
-  private enabled = true;
-  private width = 1;
-  private height = 1;
+  rt: WebGLRenderTarget;
+  private scene = new Scene();
+  private cam = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private mat: ShaderMaterial;
+  private halfOk: boolean;
+  private floatOk: boolean;
+  time = 0;
 
-  constructor(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera) {
-    this.composer = new EffectComposer(renderer);
-    this.composer.addPass(new RenderPass(scene, camera));
-
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.35, 0.5, 0.85);
-    this.composer.addPass(this.bloom);
-
-    this.fpvPass = new ShaderPass(FPVShader);
-    this.composer.addPass(this.fpvPass);
-
-    this.composer.addPass(new OutputPass());
+  constructor(private renderer: WebGLRenderer) {
+    this.floatOk = renderer.extensions.has('EXT_color_buffer_float');
+    this.halfOk = this.floatOk || renderer.extensions.has('EXT_color_buffer_half_float');
+    this.rt = this.makeRT(2, 2, 0);
+    this.mat = new ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: this.rt.texture },
+        uRes: { value: [2, 2] },
+        uTime: { value: 0 },
+        uNoise: { value: 0 },
+        uGlitch: { value: 0 },
+        uVignette: { value: 0.6 },
+        uChroma: { value: 1 },
+        uGrain: { value: 0.05 },
+        uScan: { value: 1 },
+        uGain: { value: 1 },
+        uSat: { value: 1 },
+        uAnalog: { value: 1 },
+        uFlash: { value: 0 },
+      },
+      vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+      fragmentShader: FRAG,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const g = new BufferGeometry();
+    g.setAttribute('position', new Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3));
+    g.setAttribute('uv', new Float32BufferAttribute([0, 0, 2, 0, 0, 2], 2));
+    const quad = new Mesh(g, this.mat);
+    quad.frustumCulled = false;
+    this.scene.add(quad);
   }
 
-  setQuality(q: Quality, isMobile: boolean): void {
-    const useBloom = q === 'high' && !isMobile;
-    this.bloom.enabled = useBloom;
-    this.enabled = q !== 'low';
-    this.fpvPass.uniforms.uGrain.value = q === 'high' ? 0.05 : 0.075;
+  private makeRT(w: number, h: number, samples: number) {
+    return new WebGLRenderTarget(w, h, {
+      // MSAA для RGBA16F требует EXT_color_buffer_float; иначе безопасный 8-бит
+      type: (samples > 0 ? this.floatOk : this.halfOk) ? HalfFloatType : UnsignedByteType,
+      minFilter: LinearFilter,
+      magFilter: LinearFilter,
+      depthBuffer: true,
+      samples,
+    });
   }
 
-  setCamera(camera: THREE.Camera): void {
-    const renderPass = this.composer.passes[0] as RenderPass;
-    renderPass.camera = camera;
+  setSize(w: number, h: number, samples: number) {
+    this.rt.dispose();
+    this.rt = this.makeRT(w, h, samples);
+    this.mat.uniforms.tDiffuse.value = this.rt.texture;
+    this.mat.uniforms.uRes.value = [w, h];
   }
 
-  update(time: number, noise: number, analog: boolean): void {
-    const u = this.fpvPass.uniforms;
-    u.uTime.value = time;
-    u.uNoise.value = Math.min(0.95, noise);
-    u.uAnalog.value = analog ? 1 : 0;
-    u.uScan.value = analog ? 0.14 : 0.05;
-    u.uBand.value = analog && noise > 0.45 ? 0.7 : analog ? 0.12 : 0;
-  }
-
-  setSize(w: number, h: number): void {
-    this.width = w;
-    this.height = h;
-    this.composer.setSize(w, h);
-  }
-
-  render(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera): void {
-    if (this.enabled) {
-      this.composer.render();
-    } else {
-      renderer.render(scene, camera);
-    }
-  }
-
-  get pixelWidth(): number {
-    return this.width;
-  }
-
-  get pixelHeight(): number {
-    return this.height;
+  render(scene: Scene, camera: Camera, p: FxParams, dt: number) {
+    this.time += dt;
+    const u = this.mat.uniforms;
+    u.uTime.value = this.time;
+    u.uNoise.value = p.noise;
+    u.uGlitch.value = p.glitch;
+    u.uVignette.value = p.vignette;
+    u.uChroma.value = p.chroma;
+    u.uGrain.value = p.grain;
+    u.uScan.value = p.scan;
+    u.uGain.value = p.gain;
+    u.uSat.value = p.sat;
+    u.uAnalog.value = p.analog;
+    u.uFlash.value = p.flash;
+    this.renderer.setRenderTarget(this.rt);
+    this.renderer.render(scene, camera);
+    this.renderer.setRenderTarget(null);
+    this.renderer.render(this.scene, this.cam);
   }
 }

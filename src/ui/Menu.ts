@@ -1,374 +1,319 @@
-import { TITLE, VERSION } from '../config';
-import { FREE_FLIGHT, MISSIONS, TRAININGS } from '../missions/MissionData';
-import type { MissionDef, Settings } from '../types';
-import { clearRecords, DEFAULT_SETTINGS, loadRecords } from '../utils/Storage';
-import { formatTime } from '../utils/MathUtils';
+import type { Settings } from '../config';
+import { FREE, MISSIONS, type Category, type MissionDef } from '../missions/MissionData';
+import type { MissionResult } from '../missions/MissionManager';
+import { loadRecords } from '../utils/Storage';
 
-export interface MenuHandlers {
-  startMode(def: MissionDef): void;
+export interface MenuCallbacks {
+  start(def: MissionDef): void;
   resume(): void;
   restart(): void;
-  exitToMenu(): void;
-  settingsChanged(s: Settings): void;
-  restoreTargets(): void;
+  toMenu(): void;
+  changed(path: string): void;
+  preset(name: 'beginner' | 'pilot' | 'pro'): void;
 }
 
-type Screen = 'main' | 'missions' | 'training' | 'settings' | 'pause' | 'results' | 'help';
+type Ctl =
+  | { path: string; label: string; type: 'range'; min: number; max: number; step: number; unit?: string; scale?: number }
+  | { path: string; label: string; type: 'select'; options: [string, string][] }
+  | { path: string; label: string; type: 'toggle' };
 
-/**
- * Все меню приложения на DOM. Один корень #menu-root,
- * экраны перерисовываются innerHTML, обработчики вешаются заново.
- */
+interface Section {
+  title: string;
+  ctls: Ctl[];
+}
+
+const SECTIONS: Section[] = [
+  {
+    title: 'Полёт',
+    ctls: [
+      { path: 'flightMode', label: 'Режим полёта', type: 'select', options: [['angle', 'Angle (новичок)'], ['horizon', 'Horizon'], ['acro', 'Acro (ручной)']] },
+      { path: 'throttleMode', label: 'Газ', type: 'select', options: [['assist', 'Помощь: центр = висение'], ['hold', 'Как на пульте (удержание)']] },
+      { path: 'maxThrottle', label: 'Макс. газ', type: 'range', min: 0.5, max: 1, step: 0.01, unit: '%', scale: 100 },
+    ],
+  },
+  {
+    title: 'Rates — крен/тангаж (Actual Rates)',
+    ctls: [
+      { path: 'rpRates.center', label: 'Center sens', type: 'range', min: 20, max: 300, step: 5, unit: '°/с' },
+      { path: 'rpRates.max', label: 'Max rate', type: 'range', min: 200, max: 1000, step: 10, unit: '°/с' },
+      { path: 'rpRates.expo', label: 'Expo', type: 'range', min: 0, max: 0.8, step: 0.01 },
+    ],
+  },
+  {
+    title: 'Rates — рысканье',
+    ctls: [
+      { path: 'yawRates.center', label: 'Center sens', type: 'range', min: 20, max: 300, step: 5, unit: '°/с' },
+      { path: 'yawRates.max', label: 'Max rate', type: 'range', min: 100, max: 800, step: 10, unit: '°/с' },
+      { path: 'yawRates.expo', label: 'Expo', type: 'range', min: 0, max: 0.8, step: 0.01 },
+    ],
+  },
+  {
+    title: 'Дрон',
+    ctls: [
+      { path: 'mass', label: 'Масса (с грузом)', type: 'range', min: 0.5, max: 1.6, step: 0.05, unit: ' кг' },
+      { path: 'twr', label: 'Тяговооружённость (TWR)', type: 'range', min: 3, max: 10, step: 0.1 },
+    ],
+  },
+  {
+    title: 'Управление',
+    ctls: [
+      { path: 'stickSens', label: 'Чувствительность стиков', type: 'range', min: 0.5, max: 1.5, step: 0.05 },
+      { path: 'deadzone', label: 'Мёртвая зона', type: 'range', min: 0, max: 0.25, step: 0.01 },
+      { path: 'touchUi', label: 'Сенсорные стики', type: 'select', options: [['auto', 'Авто'], ['on', 'Всегда'], ['off', 'Выкл']] },
+      { path: 'stickSize', label: 'Размер стиков', type: 'range', min: 0.6, max: 1.5, step: 0.05 },
+      { path: 'stickMargin', label: 'Отступ от края', type: 'range', min: 0, max: 200, step: 2, unit: ' px' },
+      { path: 'stickBottom', label: 'Отступ снизу', type: 'range', min: 0, max: 200, step: 2, unit: ' px' },
+      { path: 'padMap', label: 'Геймпад / радио', type: 'select', options: [['standard', 'Геймпад (Xbox/PS)'], ['aetr', 'Радио AETR'], ['taer', 'Радио TAER']] },
+    ],
+  },
+  {
+    title: 'Камера и экран',
+    ctls: [
+      { path: 'fov', label: 'FOV (по горизонтали)', type: 'range', min: 80, max: 140, step: 1, unit: '°' },
+      { path: 'camTilt', label: 'Наклон камеры', type: 'range', min: 0, max: 60, step: 1, unit: '°' },
+      { path: 'osdStyle', label: 'Стиль OSD', type: 'select', options: [['analog', 'Аналоговый'], ['digital', 'Цифровой']] },
+      { path: 'fpvFx', label: 'FPV-эффекты (шум, помехи)', type: 'range', min: 0, max: 1, step: 0.05 },
+      { path: 'pipper', label: 'Метка точки падения', type: 'toggle' },
+      { path: 'quality', label: 'Качество графики', type: 'select', options: [['auto', 'Авто'], ['low', 'Низкое'], ['medium', 'Среднее'], ['high', 'Высокое']] },
+    ],
+  },
+  {
+    title: 'Звук и отклик',
+    ctls: [
+      { path: 'volume', label: 'Громкость', type: 'range', min: 0, max: 1, step: 0.05 },
+      { path: 'haptics', label: 'Вибрация при крэше', type: 'toggle' },
+    ],
+  },
+  {
+    title: 'Полигон (свободный полёт)',
+    ctls: [
+      { path: 'timeOfDay', label: 'Время суток', type: 'select', options: [['day', 'День'], ['dusk', 'Сумерки'], ['night', 'Ночь']] },
+      { path: 'freeTargets', label: 'Мишени включены', type: 'toggle' },
+    ],
+  },
+];
+
+function getPath(o: unknown, path: string): unknown {
+  return path.split('.').reduce((a, k) => (a as { [k: string]: unknown })[k], o);
+}
+function setPath(o: unknown, path: string, v: unknown) {
+  const ks = path.split('.');
+  const last = ks.pop()!;
+  const t = ks.reduce((a, k) => (a as { [k: string]: unknown })[k], o) as { [k: string]: unknown };
+  t[last] = v;
+}
+
+const stars = (n: number) => '★'.repeat(n) + '☆'.repeat(3 - n);
+const fmt = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+
 export class Menu {
-  private root = document.getElementById('menu-root') as HTMLElement;
-  private settings: Settings;
-  private handlers: MenuHandlers;
-  private screen: Screen = 'main';
-  private lastResult: { win: boolean; stars: number; score: number; timeUsed: number; def: MissionDef } | null = null;
+  root = document.createElement('div');
+  private from: 'main' | 'pause' = 'main';
+  private cat: Category = 'mission';
+  private lastDef: MissionDef | null = null;
 
-  constructor(settings: Settings, handlers: MenuHandlers) {
-    this.settings = settings;
-    this.handlers = handlers;
+  constructor(
+    parent: HTMLElement,
+    private getSettings: () => Settings,
+    private cb: MenuCallbacks,
+    private getPad: () => string,
+  ) {
+    this.root.className = 'menu';
+    parent.appendChild(this.root);
+    this.root.addEventListener('click', (e) => this.onClick(e));
+    this.root.addEventListener('input', (e) => this.onInput(e));
+    this.root.addEventListener('change', (e) => this.onInput(e));
+    this.showLoading('Загрузка физики…');
   }
 
-  isMainVisible(): boolean {
-    return this.screen === 'main' || this.screen === 'missions' || this.screen === 'training' || this.screen === 'settings' || this.screen === 'help' || this.screen === 'results';
+  hide() {
+    this.root.style.display = 'none';
+  }
+  private show(html: string) {
+    this.root.style.display = 'flex';
+    this.root.innerHTML = `<div class="panel">${html}</div>`;
+    this.root.scrollTop = 0;
+  }
+  get visible() {
+    return this.root.style.display !== 'none';
   }
 
-  showMain(): void {
-    this.screen = 'main';
-    const records = loadRecords();
-    const totalStars = Object.values(records).reduce((a, r) => a + r.stars, 0);
-    const totalMax = MISSIONS.length + TRAININGS.length;
-    this.root.innerHTML = '';
-    const wrap = this.overlay();
-    const panel = this.panel(`
-      <div class="menu-title">${TITLE}</div>
-      <div class="menu-subtitle">Симулятор учебно-боевого FPV-дрона · v${VERSION}</div>
-      <div class="menu-col">
-        <button class="menu-btn primary" data-act="missions">MISSIONS · МИССИИ</button>
-        <button class="menu-btn" data-act="training">TRAINING · ТРЕНИРОВКИ</button>
-        <button class="menu-btn" data-act="free">FREE FLIGHT · СВОБОДНЫЙ ПОЛЁТ</button>
-        <button class="menu-btn" data-act="settings">НАСТРОЙКИ</button>
-        <button class="menu-btn" data-act="help">УПРАВЛЕНИЕ / ПОМОЩЬ</button>
+  showLoading(text: string) {
+    this.show(`<h1>FPV<span>·</span>TACTICAL</h1><p class="sub">${text}</p>`);
+  }
+
+  showMain() {
+    const pad = this.getPad();
+    this.show(`
+      <h1>FPV<span>·</span>TACTICAL</h1>
+      <p class="sub">Учебно-боевой FPV-симулятор · военный полигон</p>
+      <div class="col">
+        <button class="big" data-act="list" data-cat="mission">▶ Миссии</button>
+        <button class="big" data-act="list" data-cat="training">◎ Тренировки</button>
+        <button class="big" data-act="free">✈ Свободный полёт</button>
+        <button class="big alt" data-act="settings">⚙ Настройки</button>
+        <button class="big alt" data-act="help">? Как управлять</button>
       </div>
-      <div class="menu-subtitle" style="margin-top:14px">★ ${totalStars} / ${totalMax * 3}</div>
-    `);
-    wrap.appendChild(panel);
-    this.root.appendChild(wrap);
-    panel.querySelector('[data-act="missions"]')!.addEventListener('click', () => { this.click(); this.showMissions(); });
-    panel.querySelector('[data-act="training"]')!.addEventListener('click', () => { this.click(); this.showTraining(); });
-    panel.querySelector('[data-act="free"]')!.addEventListener('click', () => { this.click(); this.handlers.startMode(FREE_FLIGHT); });
-    panel.querySelector('[data-act="settings"]')!.addEventListener('click', () => { this.click(); this.showSettings('main'); });
-    panel.querySelector('[data-act="help"]')!.addEventListener('click', () => { this.click(); this.showHelp(); });
+      <p class="note">${pad ? `🎮 Подключён контроллер: ${pad.slice(0, 40)}` : 'Подключите геймпад или радиоаппаратуру (USB Joystick) — определится автоматически.'}</p>
+      <p class="note">Только игровая симуляция: учебная нагрузка условна, эффекты стилизованы.</p>`);
   }
 
-  private cardList(defs: MissionDef[], back: () => void, heading: string): void {
-    const records = loadRecords();
-    this.root.innerHTML = '';
-    const wrap = this.overlay();
-    const cards = defs.map((def) => {
-      const r = records[def.id];
-      const stars = r ? '★'.repeat(r.stars) + '☆'.repeat(3 - r.stars) : '☆☆☆';
-      const best = r
-        ? (r.bestTime > 0 ? `⏱ ${formatTime(r.bestTime)}<br/>` : '') + `${r.bestScore} очк.`
-        : '—';
-      return `
-        <div class="mission-card" data-id="${def.id}">
-          <div class="mc-icon">${def.icon}</div>
-          <div class="mc-body">
-            <div class="mc-title">${def.title}</div>
-            <div class="mc-desc">${def.desc}${def.timeLimit > 0 ? ` · ${formatTime(def.timeLimit)}` : ''}</div>
-          </div>
-          <div>
-            <div class="mc-stars">${stars}</div>
-            <div class="mc-best">${best}</div>
-          </div>
-        </div>`;
+  showList(cat: Category) {
+    this.cat = cat;
+    const rec = loadRecords();
+    const items = MISSIONS.filter((m) => m.category === cat)
+      .map((m) => {
+        const r = rec[m.id];
+        const goal = m.objectives.map((o) => o.label).join(' · ');
+        return `<button class="card" data-act="start" data-id="${m.id}">
+          <div class="ct"><b>${m.title}</b><span class="st">${stars(r?.stars ?? 0)}</span></div>
+          <div class="cd">${m.brief}</div>
+          <div class="cm">${goal} · лимит ${fmt(m.timeLimit)}${m.tod === 'night' ? ' · ночь' : ''}</div>
+          <div class="cm dim">${r ? `Рекорд: ${r.bestScore} очк.${r.bestTime ? ` · ${fmt(r.bestTime)}` : ''} · попыток ${r.attempts}` : 'Нет результатов'}</div>
+        </button>`;
+      })
+      .join('');
+    this.show(`<h2>${cat === 'mission' ? 'Миссии' : 'Тренировочные испытания'}</h2><div class="cards">${items}</div>
+      <button class="back" data-act="main">← Назад</button>`);
+  }
+
+  showHelp() {
+    this.show(`<h2>Управление</h2>
+      <div class="help">
+        <p><b>Сенсорный экран.</b> Левый стик: вертикаль — газ, горизонталь — рысканье (Mode 2). Правый: тангаж + крен. Кнопки ARM / DROP / CAM / VIEW / MODE — по краям.</p>
+        <p><b>Взлёт:</b> нажмите ARM, затем потяните левый стик вверх. В режиме «помощь» центр стика = висение; в режиме «как на пульте» стик газа не возвращается.</p>
+        <p><b>Сброс нагрузки:</b> метка-кружок на экране показывает точку падения. Поместите её на цель и нажмите DROP.</p>
+        <p><b>Клавиатура:</b> W/S газ · A/D рысканье · стрелки тангаж/крен · Space ARM · F сброс · R reset · V вид · M режим · Q/E камера · Esc пауза.</p>
+        <p><b>Геймпад:</b> A — ARM, B/RB — сброс, X — reset, Y — вид, LB — режим, D-pad ↑↓ — наклон камеры, Start — пауза. Для радио: AUX1 (ось 5) — ARM, AUX2 — сброс.</p>
+        <p><b>Режимы:</b> Angle — самовыравнивание, Horizon — смешанный, Acro — ручное управление скоростями вращения. Rates настраиваются в меню (Betaflight Actual Rates).</p>
+        <p><b>Сигнал:</b> при удалении и за препятствиями картинка зашумляется; потеря сигнала → failsafe и возврат на площадку.</p>
+      </div>
+      <button class="back" data-act="main">← Назад</button>`);
+  }
+
+  showSettings(from: 'main' | 'pause') {
+    this.from = from;
+    const s = this.getSettings();
+    const rows = SECTIONS.map((sec) => {
+      const ctl = sec.ctls
+        .map((c) => {
+          const v = getPath(s, c.path);
+          if (c.type === 'range') {
+            const sc = c.scale ?? 1;
+            const shown = (Number(v) * sc).toFixed(c.step < 0.1 && sc === 1 ? 2 : c.step < 1 && sc === 1 ? 1 : 0);
+            return `<label class="row"><span>${c.label}</span><em data-val="${c.path}">${shown}${c.unit ?? ''}</em>
+              <input type="range" data-path="${c.path}" min="${c.min}" max="${c.max}" step="${c.step}" value="${v}"></label>`;
+          }
+          if (c.type === 'select') {
+            return `<label class="row"><span>${c.label}</span><select data-path="${c.path}">${c.options
+              .map(([val, name]) => `<option value="${val}" ${val === v ? 'selected' : ''}>${name}</option>`)
+              .join('')}</select></label>`;
+          }
+          return `<label class="row"><span>${c.label}</span><input type="checkbox" data-path="${c.path}" ${v ? 'checked' : ''}></label>`;
+        })
+        .join('');
+      return `<section><h3>${sec.title}</h3>${ctl}</section>`;
     }).join('');
-    const panel = this.panel(`
-      <div class="menu-h2">${heading}</div>
-      <div class="menu-cards">${cards}</div>
-      <div class="menu-col"><button class="menu-btn ghost" data-act="back">← НАЗАД</button></div>
-    `);
-    wrap.appendChild(panel);
-    this.root.appendChild(wrap);
-    for (const el of Array.from(panel.querySelectorAll('.mission-card'))) {
-      el.addEventListener('click', () => {
-        const id = (el as HTMLElement).dataset.id;
-        const def = defs.find((d) => d.id === id);
-        if (def) {
-          this.click();
-          this.handlers.startMode(def);
-        }
-      });
-    }
-    panel.querySelector('[data-act="back"]')!.addEventListener('click', () => { this.click(); back(); });
-  }
-
-  showMissions(): void {
-    this.screen = 'missions';
-    this.cardList(MISSIONS, () => this.showMain(), 'MISSIONS · МИССИИ');
-  }
-
-  showTraining(): void {
-    this.screen = 'training';
-    this.cardList(TRAININGS, () => this.showMain(), 'TRAINING · ТРЕНИРОВКИ');
-  }
-
-  showPause(): void {
-    this.screen = 'pause';
-    this.root.innerHTML = '';
-    const wrap = this.overlay();
-    const panel = this.panel(`
-      <div class="menu-h2" style="text-align:center">ПАУЗА</div>
-      <div class="menu-col">
-        <button class="menu-btn primary" data-act="resume">ПРОДОЛЖИТЬ</button>
-        <button class="menu-btn" data-act="restart">ЗАНОВО</button>
-        <button class="menu-btn" data-act="restore">ВОССТАНОВИТЬ МИШЕНИ</button>
-        <button class="menu-btn" data-act="settings">НАСТРОЙКИ</button>
-        <button class="menu-btn ghost" data-act="exit">ВЫХОД В МЕНЮ</button>
+    this.show(`<h2>Настройки</h2>
+      <div class="presets">
+        <button data-act="preset" data-p="beginner">Новичок<br><small>Angle + помощь</small></button>
+        <button data-act="preset" data-p="pilot">Пилот<br><small>Horizon</small></button>
+        <button data-act="preset" data-p="pro">Про<br><small>Acro</small></button>
       </div>
-    `);
-    wrap.appendChild(panel);
-    this.root.appendChild(wrap);
-    panel.querySelector('[data-act="resume"]')!.addEventListener('click', () => { this.click(); this.handlers.resume(); });
-    panel.querySelector('[data-act="restart"]')!.addEventListener('click', () => { this.click(); this.handlers.restart(); });
-    panel.querySelector('[data-act="restore"]')!.addEventListener('click', () => { this.click(); this.handlers.restoreTargets(); this.handlers.resume(); });
-    panel.querySelector('[data-act="settings"]')!.addEventListener('click', () => { this.click(); this.showSettings('pause'); });
-    panel.querySelector('[data-act="exit"]')!.addEventListener('click', () => { this.click(); this.handlers.exitToMenu(); });
+      ${rows}
+      <p class="note">Масса и TWR применяются мгновенно. Настройки сохраняются автоматически.</p>
+      <button class="back" data-act="${from === 'pause' ? 'pause' : 'main'}">← Назад</button>`);
   }
 
-  showResults(result: { win: boolean; stars: number; score: number; timeUsed: number; def: MissionDef }, hasNext: boolean): void {
-    this.screen = 'results';
-    this.lastResult = result;
-    const starsHtml = result.win
-      ? `<span class="on">${'★'.repeat(result.stars)}</span><span class="off">${'☆'.repeat(3 - result.stars)}</span>`
-      : `<span class="off">☆☆☆</span>`;
-    const records = loadRecords();
-    const rec = records[result.def.id];
-    this.root.innerHTML = '';
-    const wrap = this.overlay();
-    const panel = this.panel(`
-      <div class="results-title ${result.win ? 'win' : 'fail'}">${result.win ? 'МИССИЯ ВЫПОЛНЕНА' : 'ПРОВАЛ'}</div>
-      <div class="results-stars">${starsHtml}</div>
-      <div class="results-grid">
-        <div class="results-cell"><div class="rc-val">${result.score}</div><div class="rc-lbl">ОЧКИ</div></div>
-        <div class="results-cell"><div class="rc-val">${formatTime(result.timeUsed)}</div><div class="rc-lbl">ВРЕМЯ</div></div>
-        <div class="results-cell"><div class="rc-val">${rec ? rec.bestScore : '—'}</div><div class="rc-lbl">РЕКОРД</div></div>
-      </div>
-      <div class="menu-subtitle">${result.def.title}</div>
-      <div class="menu-col menu-row">
-        <button class="menu-btn primary" data-act="retry">ЕЩЁ РАЗ</button>
-        ${hasNext ? '<button class="menu-btn" data-act="next">ДАЛЕЕ →</button>' : ''}
-      </div>
-      <div class="menu-col"><button class="menu-btn ghost" data-act="menu">В МЕНЮ</button></div>
-    `);
-    wrap.appendChild(panel);
-    this.root.appendChild(wrap);
-    panel.querySelector('[data-act="retry"]')!.addEventListener('click', () => { this.click(); this.handlers.startMode(result.def); });
-    const nextBtn = panel.querySelector('[data-act="next"]');
-    if (nextBtn) {
-      nextBtn.addEventListener('click', () => {
-        this.click();
-        const all = [...MISSIONS, ...TRAININGS];
-        const i = all.findIndex((d) => d.id === result.def.id);
-        this.handlers.startMode(all[(i + 1) % all.length]);
-      });
-    }
-    panel.querySelector('[data-act="menu"]')!.addEventListener('click', () => { this.click(); this.showMain(); });
+  showPause() {
+    this.show(`<h2>Пауза</h2>
+      <div class="col">
+        <button class="big" data-act="resume">▶ Продолжить</button>
+        <button class="big alt" data-act="restart">⟲ Начать заново</button>
+        <button class="big alt" data-act="settings-pause">⚙ Настройки</button>
+        <button class="big alt" data-act="tomenu">⌂ В главное меню</button>
+      </div>`);
   }
 
-  showSettings(back: 'main' | 'pause'): void {
-    const prevScreen = this.screen;
-    this.screen = 'settings';
-    const s = this.settings;
-    this.root.innerHTML = '';
-    const wrap = this.overlay();
-
-    const slider = (id: string, label: string, sub: string, min: number, max: number, step: number, val: number, fmt: (v: number) => string) => `
-      <div class="setting-row">
-        <div class="setting-label">${label}<small>${sub}</small></div>
-        <input type="range" id="set-${id}" min="${min}" max="${max}" step="${step}" value="${val}" />
-        <div class="setting-value" id="val-${id}">${fmt(val)}</div>
-      </div>`;
-
-    const panel = this.panel(`
-      <div class="menu-h2">НАСТРОЙКИ</div>
-      <div class="settings-list">
-        <div class="setting-row">
-          <div class="setting-label">Качество<small>адаптивное по умолчанию</small></div>
-          <select id="set-quality">
-            <option value="auto" ${s.quality === 'auto' ? 'selected' : ''}>Авто</option>
-            <option value="low" ${s.quality === 'low' ? 'selected' : ''}>Низкое</option>
-            <option value="medium" ${s.quality === 'medium' ? 'selected' : ''}>Среднее</option>
-            <option value="high" ${s.quality === 'high' ? 'selected' : ''}>Высокое</option>
-          </select>
-        </div>
-        <div class="setting-row">
-          <div class="setting-label">Освещение<small>день / сумерки</small></div>
-          <select id="set-lighting">
-            <option value="day" ${s.lighting === 'day' ? 'selected' : ''}>День</option>
-            <option value="dusk" ${s.lighting === 'dusk' ? 'selected' : ''}>Сумерки</option>
-          </select>
-        </div>
-        <div class="setting-row">
-          <div class="setting-label">Стиль OSD<small>Betaflight-аналог / цифра</small></div>
-          <select id="set-osd">
-            <option value="analog" ${s.osdStyle === 'analog' ? 'selected' : ''}>Аналог</option>
-            <option value="digital" ${s.osdStyle === 'digital' ? 'selected' : ''}>Цифровой</option>
-          </select>
-        </div>
-        ${slider('rcRate', 'RC Rate', 'отклик стиков', 0.6, 1.6, 0.05, s.rcRate, (v) => v.toFixed(2))}
-        ${slider('superRate', 'Super Rate', 'скорость на краях', 0.3, 0.95, 0.05, s.superRate, (v) => v.toFixed(2))}
-        ${slider('expo', 'Expo', 'сглаживание центра', 0, 0.6, 0.05, s.expo, (v) => v.toFixed(2))}
-        ${slider('stickSens', 'Чувствительность стиков', '', 0.5, 1.5, 0.05, s.stickSens, (v) => v.toFixed(2))}
-        ${slider('maxThrottle', 'Макс. газ', '%', 60, 120, 5, s.maxThrottle, (v) => `${v}%`)}
-        ${slider('camTilt', 'Наклон камеры', 'град вверх', 0, 45, 5, s.camTilt, (v) => `${v}°`)}
-        ${slider('fov', 'FOV', 'угол обзора', 80, 130, 5, s.fov, (v) => `${v}°`)}
-        ${slider('twr', 'Тяговооружённость', 'TWR', 1.5, 4, 0.1, s.twr, (v) => v.toFixed(1))}
-        ${slider('massKg', 'Масса дрона', 'кг', 0.4, 1.2, 0.02, s.massKg, (v) => `${v.toFixed(2)} кг`)}
-        ${slider('volume', 'Громкость', '', 0, 1, 0.05, s.volume, (v) => `${Math.round(v * 100)}%`)}
-        ${slider('shake', 'Тряска камеры', '', 0, 1, 0.05, s.shake, (v) => v.toFixed(2))}
-        ${slider('stickScale', 'Размер стиков', '', 0.7, 1.4, 0.05, s.stickScale, (v) => v.toFixed(2))}
-        <div class="setting-row">
-          <div class="setting-label">Показывать FPS</div>
-          <input type="checkbox" id="set-showFps" ${s.showFps ? 'checked' : ''} />
-        </div>
-      </div>
-      <div class="menu-col menu-row">
-        <button class="menu-btn ghost" data-act="reset-records">СБРОС РЕКОРДОВ</button>
-        <button class="menu-btn ghost" data-act="reset-default">СБРОС НАСТРОЕК</button>
-      </div>
-      <div class="menu-col"><button class="menu-btn primary" data-act="back">← НАЗАД</button></div>
-    `);
-    wrap.appendChild(panel);
-    this.root.appendChild(wrap);
-
-    const emit = () => this.handlers.settingsChanged({ ...this.settings });
-
-    const bindSlider = (id: string, key: keyof Settings, fmt: (v: number) => string) => {
-      const input = panel.querySelector(`#set-${id}`) as HTMLInputElement;
-      const val = panel.querySelector(`#val-${id}`) as HTMLElement;
-      input.addEventListener('input', () => {
-        const v = parseFloat(input.value);
-        (this.settings as unknown as Record<string, unknown>)[key] = v;
-        val.textContent = fmt(v);
-        emit();
-      });
-    };
-
-    bindSlider('rcRate', 'rcRate', (v) => v.toFixed(2));
-    bindSlider('superRate', 'superRate', (v) => v.toFixed(2));
-    bindSlider('expo', 'expo', (v) => v.toFixed(2));
-    bindSlider('stickSens', 'stickSens', (v) => v.toFixed(2));
-    bindSlider('maxThrottle', 'maxThrottle', (v) => `${v}%`);
-    bindSlider('camTilt', 'camTilt', (v) => `${v}°`);
-    bindSlider('fov', 'fov', (v) => `${v}°`);
-    bindSlider('twr', 'twr', (v) => v.toFixed(1));
-    bindSlider('massKg', 'massKg', (v) => `${v.toFixed(2)} кг`);
-    bindSlider('volume', 'volume', (v) => `${Math.round(v * 100)}%`);
-    bindSlider('shake', 'shake', (v) => v.toFixed(2));
-    bindSlider('stickScale', 'stickScale', (v) => v.toFixed(2));
-
-    (panel.querySelector('#set-quality') as HTMLSelectElement).addEventListener('change', (e) => {
-      this.settings.quality = (e.target as HTMLSelectElement).value as Settings['quality'];
-      emit();
-    });
-    (panel.querySelector('#set-lighting') as HTMLSelectElement).addEventListener('change', (e) => {
-      this.settings.lighting = (e.target as HTMLSelectElement).value as Settings['lighting'];
-      emit();
-    });
-    (panel.querySelector('#set-osd') as HTMLSelectElement).addEventListener('change', (e) => {
-      this.settings.osdStyle = (e.target as HTMLSelectElement).value as Settings['osdStyle'];
-      emit();
-    });
-    (panel.querySelector('#set-showFps') as HTMLInputElement).addEventListener('change', (e) => {
-      this.settings.showFps = (e.target as HTMLInputElement).checked;
-      emit();
-    });
-
-    panel.querySelector('[data-act="reset-records"]')!.addEventListener('click', () => {
-      this.click();
-      clearRecords();
-      this.showSettings(back);
-    });
-    panel.querySelector('[data-act="reset-default"]')!.addEventListener('click', () => {
-      this.click();
-      Object.assign(this.settings, DEFAULT_SETTINGS);
-      emit();
-      this.showSettings(back);
-    });
-    panel.querySelector('[data-act="back"]')!.addEventListener('click', () => {
-      this.click();
-      if (back === 'main') this.showMain();
-      else this.showPause();
-    });
-    void prevScreen;
-  }
-
-  showHelp(): void {
-    this.screen = 'help';
-    this.root.innerHTML = '';
-    const wrap = this.overlay();
-    const panel = this.panel(`
-      <div class="menu-h2">УПРАВЛЕНИЕ</div>
-      <table class="help-table">
-        <tr><td>Левый стик</td><td>вверх/вниз — газ (не пружинит), влево/вправо — рыскание</td></tr>
-        <tr><td>Правый стик</td><td>тангаж (вперёд/назад) + крен (влево/вправо)</td></tr>
-        <tr><td>ARM</td><td>включение моторов (обязательно перед полётом)</td></tr>
-        <tr><td>DROP</td><td>сброс условного учебного груза</td></tr>
-        <tr><td>T+/T−</td><td>наклон FPV-камеры</td></tr>
-        <tr><td>RST</td><td>ресет дрона на старт</td></tr>
-        <tr><td>Клавиатура</td><td>W/S — газ, A/D — рыскание, стрелки — тангаж/крен, ЛКМ — тангаж/крен мышью</td></tr>
-        <tr><td>Клавиши</td><td>Space — ARM, F — сброс, R — ресет, Q/E — камера, P/Esc — пауза</td></tr>
-        <tr><td>Геймпад</td><td>Mode 2: левый стик газ/рыскание, правый тангаж/крен, A — ARM, B — сброс, X — ресет, Start — пауза</td></tr>
+  showResult(r: MissionResult, def: MissionDef) {
+    this.lastDef = def;
+    const idx = MISSIONS.findIndex((m) => m.id === def.id);
+    const next = r.success && idx >= 0 && MISSIONS[idx + 1] && MISSIONS[idx + 1].category === def.category ? MISSIONS[idx + 1] : null;
+    this.show(`<h2 class="${r.success ? 'ok' : 'fail'}">${r.success ? 'ЗАДАНИЕ ВЫПОЛНЕНО' : 'ЗАДАНИЕ ПРОВАЛЕНО'}</h2>
+      <p class="sub">${def.title} — ${r.reason}</p>
+      <div class="stars">${stars(r.stars)}</div>
+      <table class="stats">
+        <tr><td>Очки</td><td>${r.score}</td></tr>
+        <tr><td>Время</td><td>${fmt(r.time)}</td></tr>
+        <tr><td>Поражено целей</td><td>${r.kills}</td></tr>
+        <tr><td>Точность сброса</td><td>${r.accuracy}%</td></tr>
+        <tr><td>Крашей</td><td>${r.crashes}</td></tr>
       </table>
-      <div class="help-note">
-        Совет: в режиме ACRO дрон не самовыравнивается — держи газ ~55% для висения и двигай
-        стики короткими импульсами. Для новичков есть режим ANGLE (авто-стабилизация) —
-        переключение клавишей M на клавиатуре. Все параметры физики (rates, TWR, масса)
-        настраиваются в разделе «Настройки».
-      </div>
-      <div class="menu-col"><button class="menu-btn primary" data-act="back">← НАЗАД</button></div>
-    `);
-    wrap.appendChild(panel);
-    this.root.appendChild(wrap);
-    panel.querySelector('[data-act="back"]')!.addEventListener('click', () => { this.click(); this.showMain(); });
+      <div class="col">
+        <button class="big" data-act="retry">⟲ Повторить</button>
+        ${next ? `<button class="big" data-act="start" data-id="${next.id}">▶ Далее: ${next.title}</button>` : ''}
+        <button class="big alt" data-act="list" data-cat="${def.category}">☰ К списку</button>
+        <button class="big alt" data-act="tomenu">⌂ Главное меню</button>
+      </div>`);
   }
 
-  hide(): void {
-    this.root.innerHTML = '';
-    this.screen = 'main';
+  private onClick(e: Event) {
+    const t = (e.target as HTMLElement).closest('[data-act]') as HTMLElement | null;
+    if (!t) return;
+    const act = t.dataset.act!;
+    switch (act) {
+      case 'main':
+        return this.showMain();
+      case 'list':
+        return this.showList((t.dataset.cat as Category) ?? this.cat);
+      case 'help':
+        return this.showHelp();
+      case 'settings':
+        return this.showSettings('main');
+      case 'settings-pause':
+        return this.showSettings('pause');
+      case 'pause':
+        return this.showPause();
+      case 'free':
+        return this.cb.start(FREE);
+      case 'start': {
+        const d = MISSIONS.find((m) => m.id === t.dataset.id);
+        if (d) this.cb.start(d);
+        return;
+      }
+      case 'retry':
+        if (this.lastDef) this.cb.start(this.lastDef);
+        return;
+      case 'resume':
+        return this.cb.resume();
+      case 'restart':
+        return this.cb.restart();
+      case 'tomenu':
+        return this.cb.toMenu();
+      case 'preset':
+        this.cb.preset(t.dataset.p as 'beginner');
+        return this.showSettings(this.from);
+    }
   }
 
-  hideIfModal(): boolean {
-    return false;
-  }
-
-  private overlay(): HTMLElement {
-    const el = document.createElement('div');
-    el.className = 'menu-overlay';
-    return el;
-  }
-
-  private panel(html: string): HTMLElement {
-    const el = document.createElement('div');
-    el.className = 'menu-panel';
-    el.innerHTML = html;
-    return el;
-  }
-
-  private click(): void {
-    // щелчок через AudioBus сделает Game; здесь — только тактильный отклик
-    if (navigator.vibrate) navigator.vibrate(8);
-  }
-
-  get currentScreen(): Screen {
-    return this.screen;
-  }
-
-  get result(): typeof this.lastResult {
-    return this.lastResult;
+  private onInput(e: Event) {
+    const el = e.target as HTMLInputElement | HTMLSelectElement;
+    const path = el.dataset?.path;
+    if (!path) return;
+    const s = this.getSettings();
+    let v: unknown;
+    if (el instanceof HTMLInputElement && el.type === 'checkbox') v = el.checked;
+    else if (el instanceof HTMLInputElement && el.type === 'range') v = Number(el.value);
+    else v = el.value;
+    setPath(s, path, v);
+    if (el instanceof HTMLInputElement && el.type === 'range') {
+      const c = SECTIONS.flatMap((x) => x.ctls).find((x) => x.path === path);
+      const label = this.root.querySelector(`[data-val="${path}"]`);
+      if (label && c && c.type === 'range') {
+        const sc = c.scale ?? 1;
+        label.textContent = `${(Number(v) * sc).toFixed(c.step < 0.1 && sc === 1 ? 2 : c.step < 1 && sc === 1 ? 1 : 0)}${c.unit ?? ''}`;
+      }
+    }
+    this.cb.changed(path);
   }
 }

@@ -1,288 +1,216 @@
-import type { EventBus } from '../core/EventBus';
-import { SCORE } from '../config';
-import { PAYLOAD } from '../config';
-import type { MissionDef } from '../types';
-import { clamp } from '../utils/MathUtils';
-import { loadRecords, saveRecord } from '../utils/Storage';
+import { Vector3 } from 'three';
+import type { Level } from '../world/Level';
+import type { MissionDef } from './MissionData';
 
-export interface MissionEndResult {
-  win: boolean;
-  stars: number;
-  score: number;
-  timeUsed: number;
-  def: MissionDef;
-}
-
-interface ObjectiveState {
-  done: boolean;
+export interface ObjectiveState {
+  label: string;
   progress: number;
-  total: number;
+  target: number;
+  done: boolean;
+  type: string;
 }
 
-/**
- * Прогресс миссии: последовательные цели, таймер, очки, звёзды.
- * Слушает игровые события (попадания, ворота, сброс) через EventBus.
- */
+export interface MissionResult {
+  success: boolean;
+  reason: string;
+  time: number;
+  score: number;
+  stars: number;
+  kills: number;
+  crashes: number;
+  accuracy: number;
+}
+
+export interface MissionCtx {
+  pos: Vector3;
+  speed: number;
+  agl: number;
+  armed: boolean;
+  upright: boolean;
+  payloadsInFlight: number;
+  payloadsLeft: number;
+}
+
+/** Логика целей, очков, таймера и звёзд */
 export class MissionManager {
-  current: MissionDef | null = null;
-  running = false;
-  timeLeft = 0;
+  def: MissionDef | null = null;
+  state: 'idle' | 'running' | 'done' = 'idle';
   elapsed = 0;
   score = 0;
-  objIndex = 0;
-  objStates: ObjectiveState[] = [];
+  kills = 0;
+  crashes = 0;
+  drops = 0;
+  hits = 0;
+  objectives: ObjectiveState[] = [];
+  result: MissionResult | null = null;
+  hoverInside = false;
+  onEvent: (text: string, kind: 'ok' | 'warn' | 'info') => void = () => {};
+  onFinish: (r: MissionResult) => void = () => {};
 
-  private bus: EventBus;
-  private offs: Array<() => void> = [];
-  private destroyedIds = new Set<number>();
-  private landedZones = new Set<number>();
-  private hoverT = 0;
-  private lowBatTimer = 0;
-  private onEnd: (r: MissionEndResult) => void;
+  constructor(private level: Level) {}
 
-  constructor(bus: EventBus, onEnd: (r: MissionEndResult) => void) {
-    this.bus = bus;
-    this.onEnd = onEnd;
+  get timeLeft() {
+    return this.def && this.def.timeLimit > 0 ? Math.max(0, this.def.timeLimit - this.elapsed) : 0;
   }
 
-  load(def: MissionDef, restoreTargets: () => void): void {
-    this.clear();
-    this.current = def;
-    this.running = true;
-    this.timeLeft = def.timeLimit;
+  start(def: MissionDef) {
+    this.def = def;
+    this.state = 'running';
     this.elapsed = 0;
     this.score = 0;
-    this.objIndex = 0;
-    this.destroyedIds.clear();
-    this.landedZones.clear();
-    this.hoverT = 0;
-    this.objStates = def.objectives.map((o) => ({
-      done: false,
+    this.kills = 0;
+    this.crashes = 0;
+    this.drops = 0;
+    this.hits = 0;
+    this.result = null;
+    this.hoverInside = false;
+    this.objectives = def.objectives.map((o) => ({
+      label: o.label,
+      type: o.type,
       progress: 0,
-      total: o.type === 'destroy' || o.type === 'gates' || o.type === 'payload'
-        ? (o.ids?.length ?? 0)
-        : o.type === 'hover' ? (o.seconds ?? 1) : 1,
+      done: false,
+      target: o.type === 'destroy' || o.type === 'gates' ? (o.count ?? 1) : o.type === 'hover' ? (o.seconds ?? 10) : o.type === 'altitude' ? (o.altitude ?? 10) : 1,
     }));
-
-    restoreTargets();
-    this.highlightActive();
-
-    this.offs.push(
-      this.bus.on('targetDestroyed', (...a) => {
-        const id = a[0] as number;
-        this.destroyedIds.add(id);
-        this.bus.emit('score', a[1] as number);
-      }),
-      this.bus.on('gatePassed', (...a) => {
-        const idx = a[0] as number;
-        if (this.currentObjective()?.type === 'gates') {
-          this.bus.emit('score', SCORE.gate);
-          void idx;
-        }
-      }),
-      this.bus.on('payloadLanded', (...a) => {
-        const dist = a[1] as number;
-        const inZone = a[2] as boolean;
-        if (inZone) {
-          const pts = dist < 2 ? PAYLOAD.scoreBullseye : dist < 4.5 ? PAYLOAD.scoreGood : PAYLOAD.scoreHit;
-          this.bus.emit('score', pts);
-        }
-      }),
-    );
   }
 
-  clear(): void {
-    for (const off of this.offs) off();
-    this.offs = [];
-    this.current = null;
-    this.running = false;
+  private active(i: number) {
+    if (!this.def?.sequential) return true;
+    for (let k = 0; k < i; k++) if (!this.objectives[k].done) return false;
+    return true;
   }
 
-  currentObjective() {
-    return this.current?.objectives[this.objIndex] ?? null;
+  private add(points: number) {
+    this.score += points;
   }
 
-  private highlightActive(): void {
-    if (!this.current) return;
-    const o = this.currentObjective();
-    if (!o) return;
-    if (o.type === 'destroy') {
-      const need = (o.ids ?? []).filter((id) => !this.destroyedIds.has(id));
-      this.bus.emit('highlightTargets', need);
-    } else {
-      this.bus.emit('highlightTargets', []);
-    }
+  targetsDestroyed(count: number, points: number) {
+    if (this.state !== 'running' || count <= 0) return;
+    this.kills += count;
+    this.hits++;
+    this.add(points + (count > 1 ? 50 * (count - 1) : 0));
+    this.def!.objectives.forEach((o, i) => {
+      if (o.type === 'destroy' && !this.objectives[i].done) {
+        const s = this.objectives[i];
+        s.progress = Math.min(s.target, s.progress + count);
+        if (s.progress >= s.target) this.complete(i);
+      }
+    });
+    this.onEvent(count > 1 ? `ПОРАЖЕНО ЦЕЛЕЙ: ${count}  +${points + 50 * (count - 1)}` : `ЦЕЛЬ ПОРАЖЕНА  +${points}`, 'ok');
   }
 
-  /** Обновление каждый кадр (только в полёте) */
-  update(dt: number, dronePos: { x: number; y: number; z: number }, droneSpeed: number, droneY: number): void {
-    if (!this.running || !this.current) return;
+  payloadImpact(pos: Vector3) {
+    if (this.state !== 'running') return;
+    this.def!.objectives.forEach((o, i) => {
+      if (o.type !== 'drop' || this.objectives[i].done) return;
+      const z = this.level.zones.find((q) => q.id === o.zone);
+      if (!z) return;
+      const d = Math.hypot(pos.x - z.pos.x, pos.z - z.pos.z);
+      if (d <= z.radius) {
+        const bonus = Math.round((1 - d / z.radius) * 200);
+        this.add(300 + bonus);
+        this.hits++;
+        this.objectives[i].progress = 1;
+        this.complete(i);
+        this.onEvent(`ГРУЗ ДОСТАВЛЕН  +${300 + bonus}`, 'ok');
+      }
+    });
+  }
+
+  gatePassed(n: number, speed: number) {
+    if (this.state !== 'running') return;
+    this.add(50 + Math.round(Math.min(speed, 25) * 2));
+    this.def!.objectives.forEach((o, i) => {
+      if (o.type === 'gates' && !this.objectives[i].done) {
+        this.objectives[i].progress = n;
+        if (n >= this.objectives[i].target) this.complete(i);
+      }
+    });
+  }
+
+  crashed() {
+    if (this.state !== 'running') return;
+    this.crashes++;
+    this.add(-100);
+    this.onEvent('КРАШ  -100', 'warn');
+  }
+
+  private complete(i: number) {
+    this.objectives[i].done = true;
+    if (this.objectives.every((o) => o.done)) this.finish(true, 'Все цели выполнены');
+  }
+
+  update(dt: number, ctx: MissionCtx) {
+    if (this.state !== 'running' || !this.def) return;
     this.elapsed += dt;
-    if (this.current.timeLimit > 0) {
-      this.timeLeft -= dt;
-      if (this.timeLeft <= 0) {
-        this.timeLeft = 0;
-        this.finish(false);
-        return;
-      }
-    }
-    this.checkObjectives(dt, dronePos, droneSpeed, droneY);
-    this.checkBatteryWarn();
-  }
-
-  private checkObjectives(dt: number, dronePos: { x: number; y: number; z: number }, droneSpeed: number, droneY: number): void {
-    if (!this.current) return;
-    // свободный полёт: целей нет — миссия не завершается
-    if (this.current.objectives.length === 0) return;
-    // проверяем ВСЕ цели по порядку — переход, когда текущая выполнена
-    let guard = 0;
-    while (this.objIndex < this.current.objectives.length && guard++ < 8) {
-      const o = this.current.objectives[this.objIndex];
-      const st = this.objStates[this.objIndex];
-      if (!st || st.done) break;
-
-      switch (o.type) {
-        case 'destroy': {
-          const ids = o.ids ?? [];
-          let killed = 0;
-          for (const id of ids) if (this.destroyedIds.has(id)) killed++;
-          st.progress = killed;
-          break;
-        }
-        case 'gates': {
-          // прогресс ведёт Game через onGatePassed
-          break;
-        }
-        case 'payload': {
-          // прогресс ведёт Game через onPayloadLanded
-          break;
-        }
-        case 'hover': {
-          const a = o.anchor ?? [0, 0, 0];
-          const d = Math.hypot(dronePos.x - a[0], dronePos.y - a[1], dronePos.z - a[2]);
-          if (d < (o.radius ?? 2.5) && droneSpeed < 3) {
-            this.hoverT += dt;
-          } else {
-            this.hoverT = Math.max(0, this.hoverT - dt * 2);
+    this.hoverInside = false;
+    this.def.objectives.forEach((o, i) => {
+      const s = this.objectives[i];
+      if (s.done || !this.active(i)) return;
+      if (o.type === 'hover') {
+        const hp = this.level.hoverPoint;
+        const inside = ctx.pos.distanceTo(hp) < 2 && ctx.speed < 2 && ctx.armed;
+        this.hoverInside = inside;
+        if (inside) {
+          s.progress += dt;
+          this.add(0);
+          if (s.progress >= s.target) {
+            s.progress = s.target;
+            this.add(300);
+            this.complete(i);
           }
-          st.progress = Math.min(this.hoverT, st.total);
-          break;
+        } else s.progress = Math.max(0, s.progress - dt * 0.5);
+      } else if (o.type === 'altitude') {
+        s.progress = Math.max(s.progress, Math.min(s.target, ctx.agl));
+        if (ctx.agl >= s.target) {
+          this.add(100);
+          this.complete(i);
+          this.onEvent('ВЫСОТА ДОСТИГНУТА  +100', 'ok');
         }
-        case 'land': {
-          // определяет Game через onLanded
-          break;
+      } else if (o.type === 'land') {
+        const pad = this.level.pads.find((p) => p.id === o.pad);
+        if (pad && ctx.agl < 0.5 && ctx.speed < 0.7 && ctx.upright && Math.hypot(ctx.pos.x - pad.pos.x, ctx.pos.z - pad.pos.z) < pad.radius) {
+          s.progress = 1;
+          this.add(300);
+          this.complete(i);
+          this.onEvent('ПОСАДКА ЗАЧТЕНА  +300', 'ok');
         }
       }
+    });
+    if (this.state !== 'running') return;
 
-      if (st.progress >= st.total) {
-        st.done = true;
-        this.objIndex++;
-        this.hoverT = 0;
-        this.bus.emit('objectiveDone');
-        this.highlightActive();
-        continue;
-      }
-      break;
+    if (this.def.timeLimit > 0 && this.elapsed >= this.def.timeLimit) {
+      this.finish(false, 'Время вышло');
+      return;
     }
-
-    if (this.objIndex >= this.current.objectives.length) {
-      this.finish(true);
+    // нагрузка исчерпана, а цели «на поражение/доставку» не выполнены
+    const needPayload = this.def.objectives.some((o, i) => (o.type === 'destroy' || o.type === 'drop') && !this.objectives[i].done);
+    if (needPayload && this.def.payloads >= 0 && ctx.payloadsLeft <= 0 && ctx.payloadsInFlight === 0) {
+      this.finish(false, 'Нагрузка исчерпана');
     }
   }
 
-  private checkBatteryWarn(): void {
-    void this.running;
-  }
-
-  /** Вызывается Game при пролёте ворот */
-  onGatePassed(idx: number, expectedNext: boolean): void {
-    const o = this.currentObjective();
-    if (!o || o.type !== 'gates' || !this.running) return;
-    const ids = o.ids ?? [];
-    const expected = ids[this.objStates[this.objIndex].progress];
-    if (expectedNext && idx === expected) {
-      this.objStates[this.objIndex].progress++;
-      this.bus.emit('objectiveProgress');
-    }
-  }
-
-  /** Вызывается Game при падении груза */
-  onPayloadLanded(zoneIdx: number, inZone: boolean): void {
-    const o = this.currentObjective();
-    if (!o || o.type !== 'payload' || !this.running || !inZone) return;
-    const ids = o.ids ?? [];
-    if (ids.includes(zoneIdx) && !this.landedZones.has(zoneIdx)) {
-      this.landedZones.add(zoneIdx);
-      this.objStates[this.objIndex].progress++;
-      this.bus.emit('objectiveProgress');
-    }
-  }
-
-  /** Вызывается Game при посадке */
-  onLanded(inZone: boolean): void {
-    const o = this.currentObjective();
-    if (!o || o.type !== 'land' || !this.running) return;
-    if (inZone) {
-      this.objStates[this.objIndex].progress = 1;
-    }
-  }
-
-  private finish(win: boolean): void {
-    if (!this.running || !this.current) return;
-    this.running = false;
+  private finish(success: boolean, reason: string) {
+    if (!this.def || this.state !== 'running') return;
+    this.state = 'done';
+    const d = this.def;
     let stars = 0;
-    if (win) {
-      if (this.current.starTimes) {
-        const [t3, t2] = this.current.starTimes;
-        stars = this.elapsed <= t3 ? 3 : this.elapsed <= t2 ? 2 : 1;
-      } else if (this.current.timeLimit > 0) {
-        const ratio = this.timeLeft / this.current.timeLimit;
-        stars = ratio > 0.5 ? 3 : ratio > 0.2 ? 2 : 1;
-      } else {
-        stars = 1;
-      }
-      if (this.current.timeLimit > 0) {
-        this.score += SCORE.missionComplete + Math.round(this.timeLeft * SCORE.perSecondLeft);
-      } else {
-        this.score += SCORE.missionComplete;
-      }
+    if (success) {
+      const left = d.timeLimit > 0 ? Math.max(0, d.timeLimit - this.elapsed) : 0;
+      this.add(Math.round(left * 3));
+      stars = this.elapsed <= d.parTime ? 3 : this.elapsed <= d.parTime * 1.5 ? 2 : 1;
+      if (this.crashes >= 2) stars = Math.max(1, stars - 1);
     }
-    const result: MissionEndResult = {
-      win,
+    const shots = Math.max(1, this.drops);
+    this.result = {
+      success,
+      reason,
+      time: this.elapsed,
+      score: Math.max(0, Math.round(this.score)),
       stars,
-      score: this.score,
-      timeUsed: this.elapsed,
-      def: this.current,
+      kills: this.kills,
+      crashes: this.crashes,
+      accuracy: Math.round((Math.min(this.hits, shots) / shots) * 100),
     };
-    if (win) {
-      saveRecord(this.current.id, {
-        stars,
-        bestScore: this.score,
-        bestTime: this.current.timeLimit > 0 || this.current.starTimes ? Math.round(this.elapsed) : 0,
-      });
-    }
-    this.onEnd(result);
-  }
-
-  objectiveText(): string {
-    const o = this.currentObjective();
-    if (!this.current || !o) return this.current?.mode === 'free' ? 'Свободный полёт' : '';
-    const st = this.objStates[this.objIndex];
-    const base = o.desc.replace(/(\d+)\/(\d+)|(\d+) (с|целей|щитов|зон|ворот)?.*$/, '').trim();
-    void base;
-    if (o.type === 'hover') return `${o.desc} · ${Math.floor(st.progress)}/${st.total}с`;
-    if (st.total > 1) return `${o.desc.replace(/:?\s*\d+\/\d+/, '')} · ${st.progress}/${st.total}`;
-    return o.desc;
-  }
-
-  progressSummary(): string {
-    if (!this.current) return '';
-    return this.objStates
-      .map((s, i) => `${i + 1}: ${s.done ? '✓' : `${s.progress}/${s.total}`}`)
-      .join('  ');
-  }
-
-  timeLeftClamped(): number {
-    return clamp(this.timeLeft, 0, 9999);
+    this.onFinish(this.result);
   }
 }

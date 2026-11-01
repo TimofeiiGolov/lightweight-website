@@ -1,685 +1,810 @@
-import * as THREE from 'three';
-import { CRASH, PAYLOAD, PHYS, SIGNAL, WORLD } from '../config';
-import { EventBus } from './EventBus';
-import { InputManager } from './InputManager';
-import { SceneManager } from './SceneManager';
-import { loadSettings, saveSettings } from '../utils/Storage';
-import { DroneBody } from '../physics/DroneBody';
-import { FlightModel } from '../physics/FlightModel';
-import { WorldPhysics } from '../physics/WorldPhysics';
-import { CameraFPV } from '../drone/CameraFPV';
-import { DroneVisual } from '../drone/Drone';
-import { Payload } from '../drone/Payload';
-import { buildLevel, type LevelData } from '../world/Level';
-import { defaultTargets, Targets } from '../world/Targets';
-import { Obstacles } from '../world/Obstacles';
+import { Quaternion, Vector3, type PerspectiveCamera } from 'three';
+import { PHYS, QUALITY, type QualityLevel, type Settings } from '../config';
 import { AudioManager } from '../effects/AudioManager';
 import { Particles } from '../effects/Particles';
-import { PostProcessing } from '../effects/PostProcessing';
-import { MissionManager, type MissionEndResult } from '../missions/MissionManager';
+import { PostProcessing, type FxParams } from '../effects/PostProcessing';
+import { CameraFPV } from '../drone/CameraFPV';
+import { Drone } from '../drone/Drone';
+import { PayloadSystem, type PayloadImpact } from '../drone/Payload';
+import { FREE, type MissionDef } from '../missions/MissionData';
+import { MissionManager, type MissionResult } from '../missions/MissionManager';
+import { FlightModel, type FlightInput } from '../physics/FlightModel';
+import { WorldPhysics } from '../physics/WorldPhysics';
 import { HUD } from '../ui/HUD';
 import { Menu } from '../ui/Menu';
-import { OSD, type OSDState } from '../ui/OSD';
-import { autoQuality, toast } from '../ui/Common';
-import type { FlightInput, GameState, MissionDef, Settings, Telemetry } from '../types';
-import { clamp, damp, isMobileDevice } from '../utils/MathUtils';
+import { OSD, type OsdData } from '../ui/OSD';
+import { VirtualJoysticks } from '../ui/VirtualJoysticks';
+import { clamp, damp, terrainHeight } from '../utils/MathUtils';
+import { loadSettings, saveSettings, submitRecord } from '../utils/Storage';
+import { Gates, HoverMarker, ZoneMarkers } from '../world/Obstacles';
+import { Level } from '../world/Level';
+import { Targets } from '../world/Targets';
+import { InputManager, type Controls } from './InputManager';
+import { SceneManager, TOD } from './SceneManager';
 
-/**
- * Главный класс: игровой цикл, состояния, связывание всех подсистем.
- * Физика — фиксированный шаг 120 Гц (аккумулятор), рендер — по rAF.
- */
+type State = 'loading' | 'menu' | 'playing' | 'paused';
+
+const PILOT = new Vector3(0, 1.7, 8);
+
+/** Главный класс: цикл, состояние дрона, связка всех подсистем */
 export class Game {
-  private bus = new EventBus();
-  private scenes: SceneManager;
-  private physics = new WorldPhysics();
-  private flight = new FlightModel();
-  private body = new DroneBody();
-  private visual: DroneVisual;
-  private fpv: CameraFPV;
-  private payload = new Payload();
-  private level: LevelData | null = null;
-  private targets = new Targets();
-  private obstacles = new Obstacles();
+  settings: Settings = loadSettings();
+  private canvas = document.createElement('canvas');
+  private ui = document.createElement('div');
+  private sm!: SceneManager;
+  private post!: PostProcessing;
+  private phys!: WorldPhysics;
+  private level!: Level;
+  private targets!: Targets;
+  private gates!: Gates;
+  private zones!: ZoneMarkers;
+  private padMarks!: ZoneMarkers;
+  private hover!: HoverMarker;
+  private drone = new Drone();
+  private fpv!: CameraFPV;
+  private flight!: FlightModel;
+  private payload!: PayloadSystem;
+  private particles = new Particles();
   private audio = new AudioManager();
-  private particles: Particles;
-  private post: PostProcessing;
-  private osd = new OSD();
-  private hud: HUD;
-  private menu: Menu;
   private input: InputManager;
-  private missions: MissionManager;
+  private sticks!: VirtualJoysticks;
+  private osd!: OSD;
+  private hud!: HUD;
+  private menu!: Menu;
+  private missions!: MissionManager;
 
-  private settings: Settings;
-  private state: GameState = 'loading';
-  private flightMode: 'ACRO' | 'ANGLE' = 'ACRO';
-
-  private clock = new THREE.Clock();
+  private state: State = 'loading';
+  private raf = 0;
+  private last = 0;
+  private clock = 0;
   private acc = 0;
-  private time = 0;
-  private flightClock = 0;
+  private controls: Controls = { roll: 0, pitch: 0, yaw: 0, throttleStick: -1 };
 
-  private prevVel = new THREE.Vector3();
-  private pos = new THREE.Vector3();
-  private quat = new THREE.Quaternion();
-  private vel = new THREE.Vector3();
-  private prevPos = new THREE.Vector3();
-  private upVec = new THREE.Vector3();
-
+  // состояние дрона
+  private curPos = new Vector3(0, 0.2, 0);
+  private prevPos = new Vector3(0, 0.2, 0);
+  private curQuat = new Quaternion();
+  private prevQuat = new Quaternion();
+  private vel = new Vector3();
+  private ang = new Vector3();
+  private vPre = new Vector3();
+  private rPos = new Vector3();
+  private rQuat = new Quaternion();
+  private armed = false;
+  private crashed = false;
+  private failsafe = false;
   private crashTimer = 0;
-  private lastLandedEmit = 0;
+  private flightTime = 0;
+  private payloadsLeft = 0;
+  private reload = 0;
+  private passive = true;
+  private def: MissionDef = FREE;
+  private resultTimer = -1;
+  private freeRespawnT = 0;
+
+  // сигнал и эффекты
   private rssi = 100;
-  private rssiTimer = 0;
-  private hitMarkerT = 0;
-  private osdMessage = '';
-  private osdMessageT = 0;
-  private popups: Array<{ text: string; t: number }> = [];
-  private fpsEMA = 60;
-  private qualityDownTimer = 0;
-  private lowBatBeepT = 0;
+  private occ = 0;
+  private sigT = 0;
+  private lostT = 0;
+  private flash = 0;
+  private glitchBoost = 0;
+  private shake = 0;
+  private fx: FxParams = { noise: 0, glitch: 0, vignette: 0.6, chroma: 1, grain: 0.05, scan: 1, gain: 1, sat: 1, analog: 1, flash: 0 };
+  private osdT = 0;
+  private quality: QualityLevel = 'high';
+  private fpsAcc = 0;
+  private fpsN = 0;
+  private fpsT = 0;
+  private tmpV = new Vector3();
+  private tmpV2 = new Vector3();
+  private tmpQ = new Quaternion();
+  private pipperPt = new Vector3();
 
-  private spawnPoint = new THREE.Vector3(0, 1.6, 6);
-  private spawnYaw = 0;
-  private hoverRing: THREE.Mesh | null = null;
-
-  constructor(container: HTMLElement) {
-    this.settings = loadSettings();
-    this.scenes = new SceneManager(container);
-    this.visual = new DroneVisual();
-    this.fpv = new CameraFPV(this.scenes.width / this.scenes.height);
-    this.particles = new Particles();
-    this.post = new PostProcessing(this.scenes.renderer, this.scenes.scene, this.fpv.camera);
-    this.input = new InputManager({
-      onArmToggle: () => this.toggleArm(),
-      onReset: () => this.resetDrone(true),
-      onDrop: () => this.dropPayload(),
-      onTilt: (d) => this.changeTilt(d),
-      onPause: () => this.togglePause(),
-    });
-
-    this.menu = new Menu(this.settings, {
-      startMode: (def) => this.startMode(def),
-      resume: () => this.resume(),
-      restart: () => this.restart(),
-      exitToMenu: () => this.exitToMenu(),
-      settingsChanged: (s) => this.applySettings(s),
-      restoreTargets: () => {
-        this.targets.restoreAll();
-        toast('Мишени восстановлены');
+  constructor(private root: HTMLElement) {
+    this.input = new InputManager(() => this.settings);
+    this.canvas.className = 'view';
+    this.ui.className = 'ui';
+    root.appendChild(this.canvas);
+    root.appendChild(this.ui);
+    this.sm = new SceneManager(this.canvas);
+    this.post = new PostProcessing(this.sm.renderer);
+    this.fpv = new CameraFPV(this.sm.camera);
+    this.sticks = new VirtualJoysticks(this.ui, this.input, () => this.settings);
+    this.hud = new HUD(this.ui, this.input);
+    this.osd = new OSD(this.ui);
+    this.hud.setVisible(false);
+    this.osd.setVisible(false);
+    this.menu = new Menu(
+      this.ui,
+      () => this.settings,
+      {
+        start: (d) => this.startMission(d),
+        resume: () => this.resume(),
+        restart: () => this.startMission(this.def),
+        toMenu: () => this.toMenu(),
+        changed: (p) => this.settingsChanged(p),
+        preset: (n) => this.applyPreset(n),
       },
-    });
+      () => this.input.padName,
+    );
+    this.sm.scene.add(this.drone.group, this.particles.group);
+    this.drone.group.visible = false;
 
-    this.hud = new HUD(this.input, {
-      onPause: () => this.togglePause(),
-      onArmToggle: () => this.toggleArm(),
-      onReset: () => this.resetDrone(true),
-      onDrop: () => this.dropPayload(),
-      onTilt: (d) => this.changeTilt(d),
-    });
-
-    this.missions = new MissionManager(this.bus, (r) => this.onMissionEnd(r));
-
-    // события игры
-    this.bus.on('score', (...a) => {
-      const pts = a[0] as number;
-      this.missions.score += pts;
-      this.popups.push({ text: `+${pts}`, t: 1.6 });
-    });
-    this.bus.on('objectiveProgress', () => {
-      this.hud.setObjective(this.missions.objectiveText());
-    });
-    this.bus.on('objectiveDone', () => {
-      this.hud.setObjective(this.missions.objectiveText());
-      this.osdMessage = 'ЭТАП ВЫПОЛНЕН';
-      this.osdMessageT = 1.6;
-      this.audio.gate();
-    });
-    this.bus.on('highlightTargets', (...a) => {
-      this.targets.setHighlight(a[0] as Iterable<number>);
-    });
-
-    // аудио: первый жест пользователя
-    const unlock = () => {
-      this.audio.ensureStarted();
-      this.audio.resume();
-      window.removeEventListener('pointerdown', unlock);
-      window.removeEventListener('keydown', unlock);
-    };
-    window.addEventListener('pointerdown', unlock);
-    window.addEventListener('keydown', unlock);
-
-    // авто-пауза при сворачивании
+    this.initQuality();
+    window.addEventListener('resize', this.resize);
+    window.addEventListener('orientationchange', () => setTimeout(this.resize, 200));
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden && this.state === 'flying') this.pause();
+      if (document.hidden && this.state === 'playing') this.pause();
     });
+    this.bindInput();
+    this.resize();
+    this.last = performance.now();
+    this.raf = requestAnimationFrame(this.loop);
+    void this.init();
+  }
 
-    window.addEventListener('keydown', (e) => {
-      if (e.code === 'KeyM' && this.state === 'flying') {
-        this.flightMode = this.flightMode === 'ACRO' ? 'ANGLE' : 'ACRO';
-        toast(`Режим: ${this.flightMode}`);
-        this.audio.click();
-      }
-    });
+  dispose() {
+    cancelAnimationFrame(this.raf);
+    window.removeEventListener('resize', this.resize);
+    this.root.innerHTML = '';
+  }
 
-    this.applySettings(this.settings, true);
-    this.menu.showMain();
+  // ------------------------------------------------------------------ инициализация
+  private async init() {
+    await new Promise((r) => setTimeout(r, 40));
+    this.phys = await WorldPhysics.create();
+    this.phys.setHz(QUALITY[this.quality].physicsHz);
+    this.menu.showLoading('Строим полигон…');
+    await new Promise((r) => setTimeout(r, 40));
+    this.level = new Level(this.phys);
+    this.sm.scene.add(this.level.group);
+    this.targets = new Targets(this.level.targetDefs, this.phys);
+    this.gates = new Gates(this.level.gates);
+    this.zones = new ZoneMarkers(this.level.zones, 0x3ac0ff);
+    this.padMarks = new ZoneMarkers(this.level.pads, 0x55ff88, 40);
+    this.hover = new HoverMarker(this.level.hoverPoint);
+    this.sm.scene.add(this.targets.group, this.gates.group, this.zones.group, this.padMarks.group, this.hover.mesh);
+    this.flight = new FlightModel(this.settings);
+    this.payload = new PayloadSystem(this.phys, this.targets, (i) => this.onPayloadImpact(i));
+    this.sm.scene.add(this.payload.group);
+    this.missions = new MissionManager(this.level);
+    this.missions.onEvent = (t, k) => this.hud.notify(t, k);
+    this.missions.onFinish = (r) => this.onMissionFinish(r);
+    this.fpv.tilt = this.settings.camTilt;
+    this.osd.setStyle(this.settings.osdStyle);
+    this.audio.setVolume(this.settings.volume);
+    this.sm.setTimeOfDay('day');
+    this.level.lamps.visible = false;
+    this.targets.setActiveGroups([]);
+    this.phys.setDroneDamping(true);
     this.state = 'menu';
+    this.menu.showMain();
   }
 
-  /** Инициализация физики (вызывается из main после загрузки WASM) */
-  async initWorld(onProgress?: (p: number, text: string) => void): Promise<void> {
-    onProgress?.(0.2, 'Загрузка физического движка…');
-    await this.physics.init();
-    onProgress?.(0.55, 'Построение полигона…');
-    this.level = buildLevel(this.scenes.scene, this.physics, this.settings.lighting);
-    onProgress?.(0.8, 'Расстановка мишеней…');
-    this.targets.spawn(defaultTargets());
-    this.scenes.scene.add(this.targets.group);
-    this.obstacles.buildGates();
-    this.obstacles.buildZones();
-    this.scenes.scene.add(this.obstacles.group);
-    this.scenes.scene.add(this.visual.group);
-    this.scenes.scene.add(this.payload.mesh);
-    this.scenes.scene.add(this.particles.group);
-    this.body.create(this.physics.world, this.spawnPoint, 0, this.settings);
-    this.visual.sync(this.spawnPoint, new THREE.Quaternion());
-    onProgress?.(1, 'Готово');
+  // ------------------------------------------------------------------ качество и размер
+  private initQuality() {
+    const q = this.settings.quality;
+    if (q === 'auto') {
+      const mobile = ('ontouchstart' in window || navigator.maxTouchPoints > 0) && Math.min(screen.width, screen.height) < 900;
+      this.quality = mobile ? 'medium' : 'high';
+    } else this.quality = q;
   }
 
-  // ================= Режимы =================
-
-  private startMode(def: MissionDef): void {
-    this.audio.ensureStarted();
-    this.audio.click();
-    this.menu.hide();
-    this.missions.load(def, () => this.targets.restoreAll());
-    this.obstacles.resetGates();
-    this.spawnPoint.set(def.spawn.pos[0], def.spawn.pos[1], def.spawn.pos[2]);
-    this.spawnYaw = def.spawn.yaw;
-    this.resetDrone(false);
-    this.state = 'flying';
-    this.flightClock = 0;
-    this.hud.show();
-    this.hud.setObjective(this.missions.objectiveText());
-    this.hud.setArmed(false);
-    // кольцо для тренировки висения
-    this.updateHoverRing();
-    if (def.mode === 'free') {
-      toast('Свободный полёт — ARM и вперёд');
-    } else if (def.timeLimit > 0) {
-      this.osdMessage = def.title.toUpperCase();
-      this.osdMessageT = 2.2;
-    }
+  private applyQuality(q: QualityLevel) {
+    this.quality = q;
+    this.phys?.setHz(QUALITY[q].physicsHz);
+    this.resize();
   }
 
-  private updateHoverRing(): void {
-    const o = this.missions.currentObjective();
-    if (o?.type === 'hover' && o.anchor) {
-      if (!this.hoverRing) {
-        const geo = new THREE.TorusGeometry(2.5, 0.08, 8, 40);
-        const mat = new THREE.MeshBasicMaterial({ color: 0xffc94d, transparent: true, opacity: 0.7 });
-        this.hoverRing = new THREE.Mesh(geo, mat);
-        this.scenes.scene.add(this.hoverRing);
+  private resize = () => {
+    const p = QUALITY[this.quality];
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const f = Math.min(window.devicePixelRatio || 1, p.prCap) * p.scale;
+    const pw = Math.max(2, Math.floor(w * f));
+    const ph = Math.max(2, Math.floor(h * f));
+    this.sm.renderer.setPixelRatio(1);
+    this.sm.renderer.setSize(pw, ph, false);
+    this.post.setSize(pw, ph, p.msaa);
+    this.sm.setShadows(p.shadow);
+    this.sm.resizeCamera(w, h);
+    this.sm.setFov(this.settings.fov);
+    this.particles.setScale(ph, this.sm.camera.fov);
+    this.sticks.layout();
+  };
+
+  private monitorFps(dt: number) {
+    this.fpsAcc += dt;
+    this.fpsN++;
+    this.fpsT += dt;
+    if (this.fpsT > 4) {
+      const fps = this.fpsN / this.fpsAcc;
+      if (this.settings.quality === 'auto' && this.state === 'playing' && fps < 38 && this.quality !== 'low') {
+        const next: QualityLevel = this.quality === 'high' ? 'medium' : 'low';
+        this.applyQuality(next);
+        this.hud.notify(`Качество снижено: ${next}`, 'info');
       }
-      this.hoverRing.position.set(o.anchor[0], o.anchor[1], o.anchor[2]);
-      this.hoverRing.visible = true;
-    } else if (this.hoverRing) {
-      this.hoverRing.visible = false;
+      this.fpsAcc = this.fpsN = this.fpsT = 0;
     }
   }
 
-  private onMissionEnd(r: MissionEndResult): void {
-    this.state = 'results';
-    this.hud.hide();
-    if (r.win) {
-      this.audio.win();
+  // ------------------------------------------------------------------ ввод
+  private bindInput() {
+    const b = this.input.bus;
+    b.on('arm', () => this.state === 'playing' && this.toggleArm());
+    b.on('reset', () => this.state === 'playing' && this.respawn(true));
+    b.on('drop', () => this.state === 'playing' && this.dropPayload());
+    b.on('tilt', (d) => {
+      if (this.state !== 'playing' && this.state !== 'paused') return;
+      this.settings.camTilt = clamp(this.settings.camTilt + d * 5, 0, 60);
+      this.fpv.tilt = this.settings.camTilt;
+      saveSettings(this.settings);
+      this.hud.notify(`Наклон камеры: ${this.settings.camTilt}°`, 'info');
+    });
+    b.on('pause', () => {
+      if (this.state === 'playing') this.pause();
+      else if (this.state === 'paused') this.resume();
+    });
+    b.on('camera', () => {
+      if (this.state !== 'playing') return;
+      this.fpv.mode = this.fpv.mode === 'fpv' ? 'chase' : 'fpv';
+      this.fpv.resetChase();
+      this.hud.notify(this.fpv.mode === 'fpv' ? 'Вид: FPV' : 'Вид: снаружи', 'info');
+    });
+    b.on('mode', () => {
+      if (this.state !== 'playing') return;
+      const order = ['angle', 'horizon', 'acro'] as const;
+      this.settings.flightMode = order[(order.indexOf(this.settings.flightMode) + 1) % 3];
+      saveSettings(this.settings);
+      this.hud.notify(`Режим: ${this.settings.flightMode.toUpperCase()}`, 'info');
+    });
+  }
+
+  private settingsChanged(path: string) {
+    saveSettings(this.settings);
+    const s = this.settings;
+    if (path === 'quality') {
+      this.initQuality();
+      this.applyQuality(this.quality);
+    } else if (path === 'fov') {
+      this.sm.setFov(s.fov);
+      this.particles.setScale(this.sm.renderer.domElement.height, this.sm.camera.fov);
+    } else if (path === 'camTilt') this.fpv.tilt = s.camTilt;
+    else if (path === 'osdStyle') this.osd.setStyle(s.osdStyle);
+    else if (path === 'volume') this.audio.setVolume(s.volume);
+    else if (path.startsWith('stick') || path === 'touchUi') this.sticks.layout();
+    else if (path === 'throttleMode') this.input.resetThrottle();
+    else if (path === 'timeOfDay' && this.def.category === 'free') this.applyTod(s.timeOfDay);
+    else if (path === 'freeTargets' && this.def.category === 'free') this.targets?.setActiveGroups(s.freeTargets ? FREE.groups : []);
+  }
+
+  private applyPreset(n: 'beginner' | 'pilot' | 'pro') {
+    const s = this.settings;
+    if (n === 'beginner') {
+      s.flightMode = 'angle';
+      s.throttleMode = 'assist';
+      s.rpRates = { center: 90, max: 600, expo: 0.25 };
+    } else if (n === 'pilot') {
+      s.flightMode = 'horizon';
+      s.throttleMode = 'hold';
+      s.rpRates = { center: 100, max: 700, expo: 0.2 };
     } else {
-      this.audio.fail();
+      s.flightMode = 'acro';
+      s.throttleMode = 'hold';
+      s.rpRates = { center: 110, max: 800, expo: 0.15 };
     }
-    const hasNext = r.def.id !== 'free';
-    this.menu.showResults(r, hasNext);
+    this.input.resetThrottle();
+    saveSettings(s);
   }
 
-  private restart(): void {
-    if (this.missions.current) {
-      this.startMode(this.missions.current);
-    }
+  // ------------------------------------------------------------------ состояние игры
+  private applyTod(t: 'day' | 'dusk' | 'night') {
+    this.sm.setTimeOfDay(t);
+    this.level.lamps.visible = TOD[t].lamps;
   }
 
-  private resume(): void {
+  private startMission(def: MissionDef) {
+    if (!this.level) return;
+    this.audio.start();
+    this.def = def;
+    const free = def.category === 'free';
+    this.applyTod(def.tod ?? (free ? this.settings.timeOfDay : 'day'));
+    this.targets.reset();
+    this.targets.setActiveGroups(free ? (this.settings.freeTargets ? FREE.groups : []) : def.groups);
+    this.gates.setActive(def.gates);
+    this.zones.setActive(def.zones);
+    this.padMarks.setActive(def.pads);
+    this.hover.mesh.visible = def.hover;
+    this.payload.clear();
+    this.payloadsLeft = def.payloads;
+    this.reload = 0;
+    this.drone.setPayload(def.payloads !== 0);
+    this.missions.start(def);
+    this.resultTimer = -1;
+    this.fpv.mode = 'fpv';
+    this.respawn(false);
+    this.state = 'playing';
     this.menu.hide();
-    this.state = 'flying';
-    this.hud.show();
-    this.audio.resume();
+    this.hud.setVisible(true);
+    this.osd.setVisible(true);
+    this.hud.notify(def.title.toUpperCase(), 'info');
+    this.last = performance.now();
+    this.freeRespawnT = 0;
+    if (this.settings.throttleMode === 'hold') this.hud.notify('Газ вниз → ARM → газ вверх', 'info');
+    else this.hud.notify('Нажмите ARM и потяните газ вверх', 'info');
   }
 
-  private pause(): void {
-    if (this.state !== 'flying') return;
+  private pause() {
     this.state = 'paused';
-    this.hud.hide();
+    this.audio.silenceMotors();
     this.menu.showPause();
   }
 
-  private togglePause(): void {
-    if (this.state === 'flying') this.pause();
-    else if (this.state === 'paused') this.resume();
+  private resume() {
+    this.state = 'playing';
+    this.menu.hide();
+    this.last = performance.now();
   }
 
-  private exitToMenu(): void {
+  private toMenu() {
     this.state = 'menu';
-    this.hud.hide();
-    this.missions.clear();
-    this.targets.restoreAll();
-    this.obstacles.resetGates();
-    this.resetDrone(false);
+    this.hud.setVisible(false);
+    this.osd.setVisible(false);
+    this.hud.showOverlay('');
+    this.audio.silenceMotors();
+    this.payload.clear();
+    this.targets.setActiveGroups([]);
+    this.gates.setActive(false);
+    this.zones.setActive([]);
+    this.padMarks.setActive([]);
+    this.hover.mesh.visible = false;
+    this.drone.group.visible = false;
+    this.applyTod('day');
     this.menu.showMain();
   }
 
-  // ================= Управление дроном =================
+  private onMissionFinish(r: MissionResult) {
+    submitRecord(this.def.id, r.stars, r.score, r.time, r.success);
+    this.hud.notify(r.success ? 'ЗАДАНИЕ ВЫПОЛНЕНО' : 'ЗАДАНИЕ ПРОВАЛЕНО', r.success ? 'ok' : 'warn');
+    this.resultTimer = 1.8;
+    if (r.success) this.audio.gate();
+  }
 
-  private toggleArm(): void {
-    if (this.state !== 'flying') return;
-    if (this.crashTimer > 0) return;
-    this.audio.ensureStarted();
-    if (!this.body.body) return;
-    if (this.flightMode === 'ACRO' && this.input.sticks.left.values.y > 0.05 && !this.armed) {
-      // защита: при газе > 5% не армим
-      toast('Убери газ перед ARM');
-      return;
-    }
-    this.armed = !this.armed;
-    if (this.armed) {
-      this.audio.arm();
-      this.popups.push({ text: 'ARMED', t: 1.2 });
-    } else {
-      this.audio.disarm();
-    }
+  // ------------------------------------------------------------------ дрон
+  private respawn(notify: boolean) {
+    this.tmpV.copy(this.level.spawn);
+    this.tmpQ.identity();
+    this.phys.teleportDrone(this.tmpV, this.tmpQ);
+    this.curPos.copy(this.tmpV);
+    this.prevPos.copy(this.tmpV);
+    this.curQuat.copy(this.tmpQ);
+    this.prevQuat.copy(this.tmpQ);
+    this.vel.set(0, 0, 0);
+    this.ang.set(0, 0, 0);
+    this.flight.reset();
+    this.armed = false;
+    this.crashed = false;
+    this.failsafe = false;
+    this.crashTimer = 0;
+    this.flightTime = 0;
+    this.lostT = 0;
+    this.occ = 0;
+    this.flash = 0;
+    this.input.resetThrottle();
+    this.fpv.resetChase();
+    this.passive = true;
+    this.phys.setDroneDamping(true);
+    this.hud.showOverlay('');
+    this.hud.setArmed(false);
+    if (notify) this.hud.notify('Дрон возвращён на площадку', 'info');
+  }
+
+  private toggleArm() {
+    if (this.crashed) return;
+    if (!this.armed) {
+      if (this.settings.throttleMode === 'hold' && this.input.holdThrottle > 0.08) {
+        this.hud.notify('СНИЗЬТЕ ГАЗ ДЛЯ ARM', 'warn');
+        this.audio.warn();
+        return;
+      }
+      if (this.tmpV.set(0, 1, 0).applyQuaternion(this.curQuat).y < 0.2 && this.curPos.y < 1) {
+        this.hud.notify('ДРОН ПЕРЕВЁРНУТ — нажмите RESET', 'warn');
+        return;
+      }
+      this.armed = true;
+    } else this.armed = false;
+    this.audio.arm(this.armed);
     this.hud.setArmed(this.armed);
   }
 
-  private armed = false;
-
-  private resetDrone(manual: boolean): void {
-    if (!this.body.body) return;
-    this.body.reset(this.spawnPoint, this.spawnYaw);
-    this.flight.reset();
-    this.armed = false;
-    this.crashTimer = 0;
-    this.input.resetThrottle();
-    this.input.resetSticks();
-    this.hud.setArmed(false);
-    if (manual) {
-      this.audio.click();
-      toast('Дрон на старте');
-    }
-  }
-
-  private changeTilt(delta: number): void {
-    this.settings.camTilt = clamp(this.settings.camTilt + delta, 0, 45);
-    this.fpv.setTilt(this.settings.camTilt);
-    saveSettings(this.settings);
-  }
-
-  private dropPayload(): void {
-    if (this.state !== 'flying' || !this.armed) {
-      if (this.state === 'flying') toast('Сначала ARM');
+  private dropPayload() {
+    if (!this.armed || this.crashed) {
+      this.hud.notify('Сначала ARM', 'warn');
       return;
     }
-    if (!this.payload.ready) return;
-    const ok = this.payload.drop(this.pos, this.vel, this.quat);
-    if (ok) {
-      this.audio.drop();
-      this.visual.showPayload(false);
+    if (this.payloadsLeft === 0 || this.reload > 0) {
+      if (this.payloadsLeft === 0) this.hud.notify('НАГРУЗКА ИСЧЕРПАНА', 'warn');
+      return;
+    }
+    this.tmpV.set(0, -0.1, 0).applyQuaternion(this.curQuat).add(this.curPos);
+    this.tmpV2.copy(this.vel);
+    this.payload.drop(this.tmpV, this.tmpV2);
+    if (this.payloadsLeft > 0) this.payloadsLeft--;
+    this.missions.drops++;
+    this.audio.drop();
+    if (this.payloadsLeft === 0) this.drone.setPayload(false);
+    else if (this.payloadsLeft < 0) {
+      this.reload = 1.4;
+      this.drone.setPayload(false);
     }
   }
 
-  // ================= Настройки =================
-
-  private applySettings(s: Settings, first = false): void {
-    this.settings = s;
-    saveSettings(s);
-    const q = s.quality === 'auto' ? autoQuality() : s.quality;
-    this.scenes.setQuality(q);
-    this.scenes.applyLighting(s.lighting);
-    this.fpv.setFov(s.fov);
-    this.fpv.setTilt(s.camTilt);
-    this.fpv.shakeAmount = s.shake;
-    this.input.sticks.sens = s.stickSens;
-    this.input.sticks.scale = s.stickScale;
-    this.input.sticks.applyScale();
-    this.post.setQuality(q, isMobileDevice());
-    this.audio.setVolume(s.volume);
-    if (!first && this.state === 'flying') {
-      // применяем массу на лету — пересоздаём тело
-      // (простой вариант: только при первом входе в режим)
+  private onPayloadImpact(i: PayloadImpact) {
+    this.particles.explosion(i.pos, 1);
+    this.audio.explosion(i.pos.distanceTo(this.curPos));
+    this.glitchBoost = Math.max(this.glitchBoost, clamp(1 - i.pos.distanceTo(this.curPos) / 40, 0, 0.8));
+    const killed = this.targets.blast(i.pos, 3.5);
+    if (i.direct && i.direct.alive) {
+      i.direct.destroy();
+      killed.push(i.direct);
     }
-    if (this.level) {
-      for (const fl of this.level.floodlights) fl.visible = s.lighting === 'dusk';
+    if (killed.length) {
+      const pts = killed.reduce((a, t) => a + t.points, 0);
+      this.missions.targetsDestroyed(killed.length, pts);
+      for (const t of killed) this.particles.explosion(t.pos, 0.6);
+    }
+    this.missions.payloadImpact(i.pos);
+  }
+
+  private onImpact(dv: number) {
+    if (dv > PHYS.crashImpact && this.armed && !this.crashed) {
+      this.crashed = true;
+      this.armed = false;
+      this.crashTimer = PHYS.crashTime;
+      this.particles.sparks(this.curPos, 40, 1.6);
+      this.particles.smokePuff(this.curPos, 4, 1.4);
+      this.audio.crash(1);
+      this.flash = 0.7;
+      this.glitchBoost = 1;
+      this.shake = 1;
+      this.missions.crashed();
+      this.hud.setArmed(false);
+      if (this.settings.haptics && navigator.vibrate) navigator.vibrate([60, 40, 120]);
+    } else if (dv > PHYS.bumpImpact) {
+      this.particles.sparks(this.curPos, 10 + dv * 2, 0.8);
+      this.audio.bump();
+      this.glitchBoost = Math.max(this.glitchBoost, 0.45);
+      this.shake = Math.max(this.shake, 0.5);
+      if (this.settings.haptics && navigator.vibrate) navigator.vibrate(30);
     }
   }
 
-  // ================= Игровой цикл =================
+  // ------------------------------------------------------------------ фиксированный шаг физики
+  private fixedStep(h: number) {
+    this.prevPos.copy(this.curPos);
+    this.prevQuat.copy(this.curQuat);
+    const c = this.controls;
+    const inp: FlightInput = { roll: c.roll, pitch: c.pitch, yaw: c.yaw, throttleStick: c.throttleStick, armed: this.armed, crashed: this.crashed };
+    const ctl = this.flight.step(h, inp, this.curQuat, this.vel, this.ang);
+    const passive = !ctl;
+    if (passive !== this.passive) {
+      this.passive = passive;
+      this.phys.setDroneDamping(passive);
+    }
+    this.phys.writeDrone(this.vel, ctl ? this.ang : null);
+    this.vPre.copy(this.vel);
+    this.targets.step(h);
+    this.phys.step();
+    this.phys.readDrone(this.curPos, this.curQuat, this.vel, this.ang);
+    const dv = this.vPre.distanceTo(this.vel);
+    if (dv > PHYS.bumpImpact) this.onImpact(dv);
 
-  start(): void {
-    this.clock.start();
-    const loop = () => {
-      requestAnimationFrame(loop);
-      const dt = Math.min(0.05, this.clock.getDelta());
-      this.tick(dt);
-    };
-    requestAnimationFrame(loop);
+    if (this.gates.active && this.gates.check(this.prevPos, this.curPos)) {
+      this.audio.gate();
+      this.missions.gatePassed(this.gates.passed, this.vel.length());
+      this.hud.notify(`ВОРОТА ${this.gates.passed}/${this.gates.total}`, 'ok');
+    }
+    if (this.curPos.y < -3 || this.curPos.lengthSq() > 1200 * 1200) this.respawn(true);
   }
 
-  private tick(dt: number): void {
-    this.time += dt;
-    this.fpsEMA = damp(this.fpsEMA, 1 / Math.max(dt, 1e-4), 2, dt);
+  // ------------------------------------------------------------------ главный цикл
+  private loop = (now: number) => {
+    this.raf = requestAnimationFrame(this.loop);
+    const dt = Math.min((now - this.last) / 1000, 0.1);
+    this.last = now;
+    this.clock += dt;
+    this.controls = this.input.sample(dt);
+    this.monitorFps(dt);
 
-    if (this.state === 'flying') {
-      this.tickFlying(dt);
-    } else {
-      // меню/пауза: слегка вращаем камеру вокруг дрона? Нет — статичный кадр FPV
-      this.fpv.update(dt, this.pos, this.quat, 0, 0);
-      this.targets.update(0);
-      this.obstacles.update(this.time);
-      this.particles.update(dt);
+    if (this.state === 'playing') this.updatePlaying(dt);
+    else if (this.state === 'loading' || this.state === 'menu' || this.state === 'paused') this.updateIdle(dt);
+    this.render(dt);
+  };
+
+  private updateIdle(dt: number) {
+    if (this.state === 'menu' || this.state === 'loading') {
+      // «витрина»: облёт полигона
+      const t = this.clock * 0.06;
+      const cam = this.sm.camera;
+      cam.position.set(30 + Math.cos(t) * 150, 38 + Math.sin(t * 1.7) * 8, -110 + Math.sin(t) * 150);
+      cam.lookAt(30, 4, -110);
+      this.sm.updateSky(cam.position);
     }
-
-    // OSD
-    const st = this.buildOSDState(dt);
-    this.osd.update(dt, st);
-    this.post.update(this.time, st.signalLost ? 1 : this.osd.noiseLevel, this.settings.osdStyle === 'analog');
-
-    // рендер
-    this.post.render(this.scenes.renderer, this.scenes.scene, this.fpv.camera);
-
-    // авто-снижение качества
-    if (this.settings.quality === 'auto' && this.fpsEMA < 38 && this.state === 'flying') {
-      this.qualityDownTimer += dt;
-      if (this.qualityDownTimer > 5) {
-        const q = this.scenes.quality;
-        if (q === 'high') {
-          this.scenes.setQuality('medium');
-          toast('Качество снижено (FPS)');
-          this.qualityDownTimer = 0;
-        } else if (q === 'medium') {
-          this.scenes.setQuality('low');
-          toast('Качество снижено (FPS)');
-          this.qualityDownTimer = 0;
-        }
-      }
-    } else {
-      this.qualityDownTimer = 0;
-    }
+    void dt;
   }
 
-  private tickFlying(dt: number): void {
-    this.input.update(dt);
-    this.input.pollGamepad();
-    const cmd = this.input.getCommand(this.settings.stickSens);
-
-    // позиция предыдущего кадра — для проверки пролёта ворот
-    this.prevPos.copy(this.pos);
-
-    // --- фиксированный шаг физики ---
+  private updatePlaying(dt: number) {
+    const hz = QUALITY[this.quality].physicsHz;
+    const h = 1 / hz;
     this.acc += dt;
     let steps = 0;
-    const h = 1 / PHYS.stepHz;
-    while (this.acc >= h && steps < PHYS.maxStepsPerFrame) {
-      this.physicsStep(h, cmd);
+    while (this.acc >= h && steps < 10) {
+      this.fixedStep(h);
       this.acc -= h;
       steps++;
     }
-    if (steps === PHYS.maxStepsPerFrame) this.acc = 0; // защита от спирали
+    if (steps >= 10) this.acc = 0;
+    const alpha = this.acc / h;
+    this.rPos.lerpVectors(this.prevPos, this.curPos, alpha);
+    this.rQuat.slerpQuaternions(this.prevQuat, this.curQuat, alpha);
 
-    // --- синхронизация ---
-    this.body.position(this.pos);
-    this.body.quaternion(this.quat);
-    this.body.velocity(this.vel);
-    this.prevPos.copy(this.pos);
-    this.visual.sync(this.pos, this.quat);
-    this.visual.updateProps(dt, this.flight.spool, this.armed);
-    this.fpv.update(dt, this.pos, this.quat, this.flight.spool, cmd.throttle);
-
-    // --- груз ---
-    this.payload.tick(dt);
-    if (this.payload.active) {
-      const res = this.payload.update(dt, this.level?.boxes ?? []);
-      if (res) {
-        this.explosion(res.point);
-      }
-      if (!this.payload.active && this.payload.ready) {
-        this.visual.showPayload(true);
-      }
-    } else if (this.payload.ready) {
-      this.visual.showPayload(true);
+    // таймеры
+    if (this.armed) this.flightTime += dt;
+    if (this.reload > 0) {
+      this.reload -= dt;
+      if (this.reload <= 0 && this.payloadsLeft < 0) this.drone.setPayload(true);
     }
-
-    // --- мир ---
-    this.targets.update(dt);
-    this.obstacles.update(this.time);
-    const gateIdx = this.obstacles.checkGatePass(this.prevPos, this.pos);
-    if (gateIdx >= 0) {
-      const g = this.obstacles.gates[gateIdx];
-      const expected = this.missions.currentObjective()?.type === 'gates';
-      if (!g.passed) {
-        g.passed = true;
-        this.audio.gate();
-        this.bus.emit('gatePassed', gateIdx);
-        this.missions.onGatePassed(gateIdx, expected);
-      }
-    }
-    this.updateHoverRing();
-    if (this.hoverRing && this.hoverRing.visible) {
-      this.hoverRing.rotation.y += dt * 0.8;
-    }
-    this.missions.update(dt, this.pos, this.vel.length(), this.pos.y);
-
-    // --- эффекты/аудио ---
-    this.particles.update(dt);
-    this.audio.update(this.armed && this.crashTimer <= 0, this.flight.spool, this.vel.length(), cmd.yaw);
-
-    // --- таймеры ---
-    this.flightClock += dt;
-    if (this.hitMarkerT > 0) this.hitMarkerT -= dt;
-    if (this.osdMessageT > 0) this.osdMessageT -= dt;
-    for (const p of this.popups) p.t -= dt;
-    this.popups = this.popups.filter((p) => p.t > 0);
-
-    // --- RSSI ---
-    this.rssiTimer -= dt;
-    if (this.rssiTimer <= 0) {
-      this.rssiTimer = 0.4;
-      this.updateRSSI();
-    }
-    this.input.jitter = this.rssi < SIGNAL.lostBelow ? 0.22 : this.rssi < 20 ? 0.08 : 0;
-
-    // --- крэш-таймер ---
-    if (this.crashTimer > 0) {
+    if (this.crashed) {
       this.crashTimer -= dt;
-      if (this.crashTimer <= 0) {
-        this.resetDrone(false);
-        this.osdMessage = 'РЕСЕТ';
-        this.osdMessageT = 1;
-      }
+      if (Math.random() < dt * 25) this.particles.smokePuff(this.curPos, 1, 0.9);
+      if (this.crashTimer <= 0) this.respawn(false);
     }
-  }
+    this.flash = damp(this.flash, 0, 2.2, dt);
+    this.glitchBoost = damp(this.glitchBoost, 0, 3.5, dt);
+    this.shake = damp(this.shake, 0, 4, dt);
 
-  private physicsStep(h: number, cmd: FlightInput): void {
-    if (!this.body.body) return;
-    this.body.velocity(this.prevVel);
-    if (this.armed && this.crashTimer <= 0) {
-      this.flight.step(cmd, this.body.body, h, this.settings, this.flightMode);
-    }
-    this.physics.step();
+    this.updateSignal(dt);
+    this.payload.update(dt);
 
-    // --- детекция удара ---
-    this.body.velocity(this.vel);
-    const dv = this.vel.distanceTo(this.prevVel);
-    if (dv > CRASH.dvThreshold && this.crashTimer <= 0) {
-      this.onCrash();
-    }
-    // --- переворот у земли ---
-    this.body.position(this.pos);
-    this.upVec.set(0, 1, 0).applyQuaternion(this.body.quaternion(this.quat));
-    if (this.armed && this.crashTimer <= 0 && this.pos.y < 0.6 && this.upVec.y < CRASH.upsideDot) {
-      this.onCrash();
-    }
-    // --- мягкая посадка (для тренировки) ---
-    const speed = this.vel.length();
-    if (this.pos.y < 0.45 && speed < CRASH.landSpeed && cmd.throttle < 0.12) {
-      if (this.time - this.lastLandedEmit > 2) {
-        this.lastLandedEmit = this.time;
-        this.checkLanding();
-      }
-    }
-  }
-
-  private onCrash(): void {
-    if (!this.armed) return;
-    this.armed = false;
-    this.crashTimer = CRASH.resetDelay;
-    this.hud.setArmed(false);
-    this.audio.crash();
-    this.particles.sparks(this.pos.x, this.pos.y, this.pos.z);
-    this.fpv.addImpact(1.2);
-    if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
-  }
-
-  private checkLanding(): void {
-    // пад в (0, 6), радиус 3.2
-    const d = Math.hypot(this.pos.x - 0, this.pos.z - 6);
-    const inZone = d < 3.4;
-    if (inZone) {
-      this.particles.dust(this.pos.x, this.pos.y, this.pos.z);
-      this.audio.gate();
-    }
-    this.missions.onLanded(inZone);
-  }
-
-  private explosion(point: THREE.Vector3): void {
-    this.particles.explosion(point.x, point.y, point.z, 1);
-    this.audio.explosion();
-    if (navigator.vibrate) navigator.vibrate(80);
-    // урон по целям
-    const destroyed = this.targets.damageRadius(point, PAYLOAD.blastRadius);
-    for (const t of destroyed) {
-      this.hitMarkerT = 0.45;
-      this.popups.push({ text: `${t.kind === 'car' || t.kind === 'walker' ? 'Мишень' : 'Цель'} +${t.points}`, t: 1.6 });
-      this.bus.emit('targetDestroyed', t.id, t.points);
-      this.audio.hit();
-    }
-    // тряска от близкого взрыва
-    const d = this.pos.distanceTo(point);
-    if (d < 25) {
-      this.fpv.addImpact((25 - d) / 25 * 0.8);
-    }
-    // зона сброса?
-    for (const z of this.obstacles.zones) {
-      const dist = Math.hypot(point.x - z.center.x, point.z - z.center.z);
-      if (dist < z.radius) {
-        this.bus.emit('payloadLanded', z.index, dist, true);
-        this.missions.onPayloadLanded(z.index, true);
-        this.popups.push({ text: dist < 2 ? 'В ЯБЛОЧКО! +300' : `ЗОНА +${dist < 4.5 ? 150 : 50}`, t: 2 });
-        break;
-      }
-    }
-  }
-
-  private updateRSSI(): void {
-    const dist = this.pos.length();
-    let rssi = 100 - SIGNAL.distPenalty * clamp(dist / WORLD.rssiMaxDist, 0, 1);
-    // прямая видимость до старта
-    if (this.level) {
-      const ox = this.pos.x, oy = this.pos.y, oz = this.pos.z;
-      const len = Math.hypot(ox, oy, oz);
-      if (len > 1) {
-        const dx = -ox / len, dy = -oy / len, dz = -oz / len;
-        for (const b of this.level.boxes) {
-          // быстрый slab-тест
-          let tmin = 0, tmax = len;
-          const o = [ox, oy, oz], d = [dx, dy, dz];
-          const bmin = [b.min.x, b.min.y, b.min.z], bmax = [b.max.x, b.max.y, b.max.z];
-          let hit = true;
-          for (let i = 0; i < 3; i++) {
-            const inv = 1 / d[i];
-            let t1 = (bmin[i] - o[i]) * inv;
-            let t2 = (bmax[i] - o[i]) * inv;
-            if (t1 > t2) { const tt = t1; t1 = t2; t2 = tt; }
-            tmin = Math.max(tmin, t1);
-            tmax = Math.min(tmax, t2);
-            if (tmin > tmax) { hit = false; break; }
-          }
-          if (hit) {
-            rssi -= SIGNAL.occludedPenalty;
-            break;
-          }
+    // дым от уничтоженных целей
+    if (this.targets) {
+      for (const t of this.targets.list) {
+        if (!t.alive && t.active && t.smoke > 0) {
+          t.smoke -= dt;
+          if (Math.random() < dt * 10) this.particles.smokePuff(this.tmpV.set(t.pos.x, t.pos.y + 0.5, t.pos.z), 1, 1.4);
         }
       }
     }
-    this.rssi = clamp(rssi, 0, 100);
-  }
+    // пыль от потока винтов вблизи земли
+    const gy = Math.max(terrainHeight(this.rPos.x, this.rPos.z), 0);
+    const agl = this.rPos.y - gy;
+    if (agl < 2.5 && this.flight.avgMotor > 0.25 && Math.random() < 0.6) {
+      this.tmpV.set(this.rPos.x, gy + 0.1, this.rPos.z);
+      this.particles.dust(this.tmpV, this.tmpV2.set(this.vel.x * 0.3, 0, this.vel.z * 0.3), 1);
+    }
 
-  private buildOSDState(dt: number): OSDState {
-    const speedKmh = this.vel.length() * 3.6;
-    const m = this.missions;
-    const lowBattery = this.flight.vbat < 22.0 && this.armed;
-    if (lowBattery) {
-      this.lowBatBeepT -= dt;
-      if (this.lowBatBeepT <= 0) {
-        this.lowBatBeepT = 1.2;
-        this.audio.lowBattery();
+    // свободный полёт: мишени восстанавливаются
+    if (this.def.category === 'free' && this.settings.freeTargets && this.targets.activeAlive().length === 0) {
+      this.freeRespawnT += dt;
+      if (this.freeRespawnT > 4) {
+        this.targets.reset();
+        this.targets.setActiveGroups(FREE.groups);
+        this.hud.notify('Мишени восстановлены', 'info');
+        this.freeRespawnT = 0;
       }
     }
-    return {
-      armed: this.armed,
-      mode: this.flightMode,
-      throttle: this.flight.spool,
-      vbat: this.flight.vbat,
-      speedKmh,
-      altM: Math.max(0, this.pos.y - 0.1),
-      rssi: this.rssi,
-      clock: this.flightClock,
-      missionTime: m.running && m.current && m.current.timeLimit > 0 ? m.timeLeft : -1,
-      score: m.score,
-      targetsLeft: m.current && m.current.mode !== 'free' ? this.targets.aliveCount() : -1,
-      objective: this.hudObjectiveText(),
-      payloadReady: this.payload.ready,
-      payloadSec: Math.max(0, this.payload.rearmT),
-      crash: this.crashTimer > 0,
-      signalLost: this.rssi < SIGNAL.lostBelow,
-      lowBattery,
-      hitMarkerT: this.hitMarkerT,
-      style: this.settings.osdStyle,
-      showFps: this.settings.showFps,
-      fps: this.fpsEMA,
-      message: this.osdMessage,
-      messageT: this.osdMessageT,
-      popups: this.popups,
-    };
-  }
 
-  private hudObjectiveText(): string {
-    if (!this.missions.current) return '';
-    if (this.missions.current.mode === 'free') return 'Свободный полёт';
-    return this.missions.objectiveText();
-  }
-
-  /** Телеметрия для внешних целей (не используется в UI, полезно для отладки) */
-  telemetry(): Telemetry {
-    return {
+    // миссия
+    const upright = this.tmpV.set(0, 1, 0).applyQuaternion(this.curQuat).y > 0.7;
+    this.missions.update(dt, {
+      pos: this.curPos,
       speed: this.vel.length(),
-      alt: this.pos.y,
-      vbat: this.flight.vbat,
-      throttle: this.flight.spool,
-      rssi: this.rssi,
-    };
+      agl,
+      armed: this.armed,
+      upright,
+      payloadsInFlight: this.payload.pending,
+      payloadsLeft: this.payloadsLeft < 0 ? 99 : this.payloadsLeft,
+    });
+    if (this.resultTimer > 0) {
+      this.resultTimer -= dt;
+      if (this.resultTimer <= 0 && this.missions.result) {
+        this.state = 'paused';
+        this.audio.silenceMotors();
+        this.menu.showResult(this.missions.result, this.def);
+      }
+    }
+    this.hover.setInside(this.missions.hoverInside);
   }
 
-  dispose(): void {
-    this.targets.dispose(this.scenes.scene);
-    this.obstacles.dispose(this.scenes.scene);
-    this.particles.dispose(this.scenes.scene);
-    this.visual.dispose(this.scenes.scene);
-    this.level?.dispose();
-    this.scenes.renderer.dispose();
+  private updateSignal(dt: number) {
+    this.sigT -= dt;
+    if (this.sigT <= 0) {
+      this.sigT = 0.15;
+      const d = this.curPos.distanceTo(PILOT);
+      let target = 0;
+      if (d > 4) {
+        this.tmpV.copy(this.curPos).sub(PILOT);
+        const len = this.tmpV.length();
+        this.tmpV.divideScalar(len);
+        const hit = this.phys.raycast(PILOT, this.tmpV, len - 0.5);
+        if (hit >= 0) target = 1;
+      }
+      this.occ += (target - this.occ) * 0.5;
+    }
+    const d = this.curPos.distanceTo(PILOT);
+    const base = clamp(100 * (1 - Math.pow(d / 480, 1.7)), 0, 100);
+    this.rssi = base * (1 - 0.62 * this.occ);
+    if (this.rssi < 6 && !this.crashed) {
+      this.lostT += dt;
+      if (this.lostT > 3 && !this.failsafe) {
+        // failsafe: дрон теряет управление и возвращается на площадку
+        this.failsafe = true;
+        this.crashed = true;
+        this.armed = false;
+        this.crashTimer = 1.6;
+        this.hud.setArmed(false);
+        this.hud.notify('FAILSAFE — потеря сигнала', 'warn');
+      }
+    } else if (this.rssi >= 6) this.lostT = Math.max(0, this.lostT - dt);
+  }
+
+  // ------------------------------------------------------------------ рендер
+  private render(dt: number) {
+    const sm = this.sm;
+    const cam = sm.camera;
+    const playing = this.state === 'playing' || this.state === 'paused';
+    if (this.level && playing) {
+      this.fpv.update(dt, this.rPos, this.rQuat, this.flight.avgMotor, this.vel.length(), this.shake);
+      this.drone.group.position.copy(this.rPos);
+      this.drone.group.quaternion.copy(this.rQuat);
+      this.drone.group.visible = this.fpv.mode === 'chase';
+      if (this.drone.group.visible) this.drone.update(dt, this.flight.motors);
+      sm.updateSky(cam.position);
+    }
+    if (this.level) {
+      this.targets.render(dt, this.clock);
+      this.gates.pulse(this.clock);
+      this.zones.update(this.clock);
+      this.padMarks.update(this.clock);
+      this.hover.mesh.rotation.y += dt * 0.5;
+    }
+    this.particles.update(dt);
+    this.sticks.update();
+    sm.followShadow(cam.position);
+
+    if (this.state === 'playing') {
+      this.audio.update(this.flight.motors, this.armed || this.crashed, this.vel.length());
+      this.osdT -= dt;
+      if (this.osdT <= 0) {
+        this.osdT = 0.05;
+        this.updateOsd(cam);
+      }
+      this.updatePipper(cam);
+    }
+
+    // FPV-эффекты
+    const q = QUALITY[this.quality];
+    const fpvOn = this.fpv.mode === 'fpv';
+    const k = this.settings.fpvFx * q.fx * (fpvOn ? 1 : 0.35);
+    const sigNoise = clamp((55 - this.rssi) / 55, 0, 1);
+    const sigGlitch = clamp((78 - this.rssi) / 78, 0, 1);
+    const analog = this.settings.osdStyle === 'analog' ? 1 : 0;
+    const f = this.fx;
+    const sigK = Math.max(0.35, this.settings.fpvFx);
+    f.noise = this.state === 'playing' || this.state === 'paused' ? Math.pow(sigNoise, 1.2) * sigK * (fpvOn ? 1 : 0.5) : 0;
+    f.glitch = clamp(Math.pow(sigGlitch, 1.5) * sigK + this.glitchBoost * Math.max(0.4, k), 0, 1);
+    f.vignette = 0.3 + 0.5 * k;
+    f.chroma = k * (analog ? 1 : 0.45);
+    f.grain = (0.02 + 0.03 * k + sm.extraNoise * (0.5 + this.settings.fpvFx)) * (this.state === 'menu' ? 0.5 : 1);
+    f.scan = k;
+    f.gain = sm.gain;
+    f.sat = analog ? 0.92 : 1;
+    f.analog = analog * (fpvOn ? 1 : 0.4) * Math.min(1, this.settings.fpvFx * 2);
+    f.flash = this.flash;
+    this.post.render(sm.scene, cam, f, dt);
+  }
+
+  private updateOsd(cam: PerspectiveCamera) {
+    const fl = this.flight;
+    const m = this.missions;
+    const free = this.def.category === 'free';
+    // ориентация камеры для горизонта
+    this.tmpV.set(1, 0, 0).applyQuaternion(cam.quaternion);
+    const roll = (Math.asin(clamp(this.tmpV.y, -1, 1)) * 180) / Math.PI;
+    this.tmpV.set(0, 0, -1).applyQuaternion(cam.quaternion);
+    const pitch = (Math.asin(clamp(this.tmpV.y, -1, 1)) * 180) / Math.PI;
+    const heading = Math.atan2(this.tmpV.x, -this.tmpV.z);
+    const gy = Math.max(terrainHeight(this.curPos.x, this.curPos.z), 0);
+
+    // целевой ориентир
+    const gp = this.guidePoint();
+    let tgtDist = -1;
+    let tgtRel = 0;
+    if (gp) {
+      const dx = gp.x - this.curPos.x;
+      const dz = gp.z - this.curPos.z;
+      tgtDist = Math.hypot(dx, dz);
+      let rel = (Math.atan2(dx, -dz) - heading) * (180 / Math.PI);
+      rel = ((rel + 540) % 360) - 180;
+      tgtRel = rel;
+    }
+
+    let warn = '';
+    if (this.failsafe) warn = 'FAILSAFE';
+    else if (this.crashed) warn = 'CRASH';
+    else if (this.rssi < 8) warn = 'NO SIGNAL';
+    else if (this.rssi < 30) warn = 'LOW SIGNAL';
+    else if (fl.batteryPct < 0.15) warn = 'LOW BATTERY';
+
+    const alive = this.targets.activeAlive().length;
+    const total = this.targets.list.filter((t) => t.active).length;
+    const d: OsdData = {
+      volt: fl.voltage,
+      mah: fl.batteryUsed,
+      battPct: fl.batteryPct,
+      mode: this.settings.flightMode === 'angle' ? 'ANGLE' : this.settings.flightMode === 'horizon' ? 'HORIZON' : 'ACRO',
+      armed: this.armed,
+      time: this.flightTime,
+      rssi: this.rssi,
+      speedKmh: this.vel.length() * 3.6,
+      alt: Math.max(0, this.curPos.y - gy - 0.1),
+      throttle: fl.throttleCmd,
+      rollDeg: roll,
+      pitchDeg: pitch,
+      tilt: this.settings.camTilt,
+      warn,
+      score: Math.round(m.score),
+      payloads: this.payloadsLeft < 0 ? 'PL ∞' : `PL ${this.payloadsLeft}`,
+      targets: total > 0 ? `TGT ${total - alive}/${total}` : '',
+      tgtDist: free && alive === 0 ? -1 : tgtDist,
+      tgtRel,
+    };
+    this.osd.update(d);
+    this.hud.updateObjectives(m);
+    this.hud.setDrop(this.payloadsLeft < 0 ? (this.reload > 0 ? '…' : '∞') : String(this.payloadsLeft), this.payloadsLeft !== 0 && this.reload <= 0);
+    const dropBtn = this.def.payloads === 0;
+    this.hud.root.classList.toggle('no-drop', dropBtn);
+
+    if (this.failsafe) this.hud.showOverlay('<div class="msg bad">FAILSAFE<small>ПОТЕРЯ СИГНАЛА</small></div>');
+    else if (this.crashed) this.hud.showOverlay(`<div class="msg bad">CRASH<small>респавн через ${Math.max(0, Math.ceil(this.crashTimer))}</small></div>`);
+    else this.hud.showOverlay('');
+  }
+
+  private guidePoint(): Vector3 | null {
+    const m = this.missions;
+    const def = this.def;
+    if (!def || m.state !== 'running') return null;
+    if (def.category === 'free') return this.targets.nearest(this.curPos)?.pos ?? null;
+    for (let i = 0; i < def.objectives.length; i++) {
+      if (m.objectives[i].done) continue;
+      const o = def.objectives[i];
+      if (o.type === 'destroy') return this.targets.nearest(this.curPos)?.pos ?? null;
+      if (o.type === 'drop') return this.level.zones.find((z) => z.id === o.zone)?.pos ?? null;
+      if (o.type === 'gates') return this.gates.next?.pos ?? null;
+      if (o.type === 'land') return this.level.pads.find((p) => p.id === o.pad)?.pos ?? null;
+      if (o.type === 'hover') return this.level.hoverPoint;
+      return null;
+    }
+    return null;
+  }
+
+  private updatePipper(cam: PerspectiveCamera) {
+    if (!this.settings.pipper || !this.armed || this.payloadsLeft === 0 || this.def.payloads === 0 || this.crashed) {
+      this.hud.setPipper(null);
+      return;
+    }
+    if (!this.payload.predict(this.curPos, this.vel, this.pipperPt)) {
+      this.hud.setPipper(null);
+      return;
+    }
+    cam.updateMatrixWorld();
+    this.tmpV.copy(this.pipperPt).project(cam);
+    if (this.tmpV.z > 1 || Math.abs(this.tmpV.x) > 1.05 || Math.abs(this.tmpV.y) > 1.05) {
+      this.hud.setPipper(null);
+      return;
+    }
+    this.hud.setPipper({ x: ((this.tmpV.x + 1) / 2) * window.innerWidth, y: ((1 - this.tmpV.y) / 2) * window.innerHeight });
   }
 }
+

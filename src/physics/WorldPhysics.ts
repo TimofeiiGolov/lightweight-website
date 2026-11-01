@@ -1,47 +1,130 @@
 import RAPIER from '@dimforge/rapier3d-compat';
-import * as THREE from 'three';
+import { Quaternion, Vector3 } from 'three';
 import { PHYS } from '../config';
 
-/** Обёртка над физическим миром Rapier */
+/** Обёртка над Rapier: статический мир, рейкасты, тело дрона */
 export class WorldPhysics {
   world!: RAPIER.World;
-  ready = false;
+  drone!: RAPIER.RigidBody;
+  private droneColliders: RAPIER.Collider[] = [];
+  private ray!: RAPIER.Ray;
 
-  async init(): Promise<void> {
+  static async create(): Promise<WorldPhysics> {
     await RAPIER.init();
-    this.world = new RAPIER.World({ x: 0, y: -PHYS.gravity, z: 0 });
-    this.world.timestep = 1 / PHYS.stepHz;
-    this.ready = true;
+    const w = new WorldPhysics();
+    w.world = new RAPIER.World({ x: 0, y: 0, z: 0 }); // гравитацию считает FlightModel
+    w.ray = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
+    w.createDrone();
+    return w;
   }
 
-  step(): void {
+  setHz(hz: number) {
+    this.world.timestep = 1 / hz;
+  }
+
+  private createDrone() {
+    const desc = RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(0, 0.1, 0)
+      .setCcdEnabled(true)
+      .setCanSleep(false)
+      .setAngularDamping(0);
+    this.drone = this.world.createRigidBody(desc);
+    const add = (d: RAPIER.ColliderDesc) => {
+      d.setMass(0.18).setFriction(0.8).setRestitution(0.18);
+      this.droneColliders.push(this.world.createCollider(d, this.drone));
+    };
+    // корпус
+    add(RAPIER.ColliderDesc.cuboid(0.055, 0.03, 0.1));
+    // опоры/моторы и диски винтов (7")
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        add(RAPIER.ColliderDesc.ball(0.03).setTranslation(sx * 0.12, -0.0, sz * 0.13));
+        add(RAPIER.ColliderDesc.cylinder(0.008, PHYS.armRadius).setTranslation(sx * 0.12, 0.045, sz * 0.13));
+      }
+    }
+  }
+
+  setDroneDamping(passive: boolean) {
+    this.drone.setAngularDamping(passive ? 2.5 : 0);
+    this.drone.setLinearDamping(0);
+  }
+
+  teleportDrone(pos: Vector3, quat: Quaternion) {
+    this.drone.setTranslation(pos, true);
+    this.drone.setRotation(quat, true);
+    this.drone.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    this.drone.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  }
+
+  readDrone(pos: Vector3, quat: Quaternion, vel: Vector3, ang: Vector3) {
+    const t = this.drone.translation();
+    const r = this.drone.rotation();
+    const v = this.drone.linvel();
+    const a = this.drone.angvel();
+    pos.set(t.x, t.y, t.z);
+    quat.set(r.x, r.y, r.z, r.w);
+    vel.set(v.x, v.y, v.z);
+    ang.set(a.x, a.y, a.z);
+  }
+
+  writeDrone(vel: Vector3, ang: Vector3 | null) {
+    this.drone.setLinvel(vel, true);
+    if (ang) this.drone.setAngvel(ang, true);
+  }
+
+  step() {
     this.world.step();
   }
 
-  /** Статичный AABB-коллайдер (здания, техника, бункер) */
-  addStaticBox(x: number, y: number, z: number, hx: number, hy: number, hz: number, yaw = 0): void {
-    const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
-    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
-    const col = RAPIER.ColliderDesc.cuboid(hx, hy, hz)
+  // ---------- статический мир ----------
+  addBox(x: number, y: number, z: number, hx: number, hy: number, hz: number, rotY = 0): RAPIER.Collider {
+    const d = RAPIER.ColliderDesc.cuboid(hx, hy, hz)
       .setTranslation(x, y, z)
-      .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
+      .setRotation({ x: 0, y: Math.sin(rotY / 2), z: 0, w: Math.cos(rotY / 2) })
       .setFriction(0.9)
       .setRestitution(0.1);
-    this.world.createCollider(col, body);
+    return this.world.createCollider(d);
   }
 
-  /** Статичный цилиндр (стволы, столбы) — аппроксимация боксом */
-  addStaticCylinder(x: number, y: number, z: number, radius: number, halfHeight: number): void {
-    this.addStaticBox(x, y, z, radius, halfHeight, radius, 0);
+  addDesc(d: RAPIER.ColliderDesc): RAPIER.Collider {
+    d.setFriction(0.9).setRestitution(0.1);
+    return this.world.createCollider(d);
   }
 
-  /** Земля — один большой бокс */
-  addGround(halfSize: number): void {
-    const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
-    const col = RAPIER.ColliderDesc.cuboid(halfSize, 0.5, halfSize)
-      .setTranslation(0, -0.5, 0)
-      .setFriction(0.95)
-      .setRestitution(0.05);
-    this.world.createCollider(col, body);
+  addTrimesh(vertices: Float32Array, indices: Uint32Array) {
+    return this.world.createCollider(RAPIER.ColliderDesc.trimesh(vertices, indices).setFriction(0.9));
+  }
+
+  addConvex(points: Float32Array): RAPIER.Collider | null {
+    const d = RAPIER.ColliderDesc.convexHull(points);
+    return d ? this.addDesc(d) : null;
+  }
+
+  createKinematic(x: number, y: number, z: number): RAPIER.RigidBody {
+    return this.world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x, y, z));
+  }
+
+  removeCollider(c: RAPIER.Collider) {
+    this.world.removeCollider(c, true);
+  }
+
+  removeBody(b: RAPIER.RigidBody) {
+    this.world.removeRigidBody(b);
+  }
+
+  static get R() {
+    return RAPIER;
+  }
+
+  /** Луч в мир (без дрона). Возвращает расстояние до первого препятствия или -1 */
+  raycast(o: Vector3, dir: Vector3, maxDist: number): number {
+    this.ray.origin.x = o.x;
+    this.ray.origin.y = o.y;
+    this.ray.origin.z = o.z;
+    this.ray.dir.x = dir.x;
+    this.ray.dir.y = dir.y;
+    this.ray.dir.z = dir.z;
+    const hit = this.world.castRay(this.ray, maxDist, true, undefined, undefined, undefined, this.drone);
+    return hit ? hit.timeOfImpact : -1;
   }
 }

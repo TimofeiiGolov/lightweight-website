@@ -1,150 +1,163 @@
-import type { MissionDef } from '../types';
+import type { TimeOfDay } from '../config';
+import type { TargetGroup } from '../world/Level';
 
-/**
- * Каталог режимов: 6 миссий, 4 тренировки, свободный полёт.
- * ids целей соответствуют порядку в defaultTargets():
- *  0..5 — щиты восточного тракта, 6..9 — манекены, 10..13 — бочки,
- *  14..15 — машины, 16..18 — пехота.
- * Ворота 0..7, зоны сброса 0..2.
- */
+export type Category = 'mission' | 'training' | 'free';
+
+export interface ObjectiveDef {
+  type: 'destroy' | 'gates' | 'drop' | 'hover' | 'land' | 'altitude';
+  label: string;
+  count?: number; // destroy / gates
+  zone?: string; // drop
+  pad?: string; // land
+  seconds?: number; // hover
+  altitude?: number; // altitude
+}
+
+export interface MissionDef {
+  id: string;
+  category: Category;
+  title: string;
+  brief: string;
+  timeLimit: number; // сек, 0 — без ограничения
+  parTime: number; // сек для 3 звёзд
+  payloads: number; // -1 — без ограничения
+  groups: TargetGroup[];
+  gates: boolean;
+  zones: string[];
+  pads: string[];
+  hover: boolean;
+  tod: TimeOfDay | null;
+  objectives: ObjectiveDef[];
+  sequential?: boolean;
+}
+
+const base = { groups: [] as TargetGroup[], gates: false, zones: [] as string[], pads: [] as string[], hover: false, tod: null as TimeOfDay | null, payloads: 0 };
+
 export const MISSIONS: MissionDef[] = [
   {
+    ...base,
     id: 'm1',
+    category: 'mission',
     title: 'Первый вылет',
-    desc: 'Уничтожь 4 щита на восточном тракте',
-    icon: '🎯',
-    mode: 'mission',
-    timeLimit: 150,
-    spawn: { pos: [0, 1.6, 6], yaw: 0 },
-    objectives: [
-      { type: 'destroy', ids: [0, 1, 2, 3], desc: 'Уничтожить щиты: 4' },
-    ],
+    brief: 'Тир на западе. Поразите 4 щита учебной нагрузкой. Метка CCIP на экране показывает точку падения.',
+    timeLimit: 180,
+    parTime: 100,
+    payloads: 8,
+    groups: ['range'],
+    objectives: [{ type: 'destroy', count: 4, label: 'Поразить цели на тире' }],
   },
   {
+    ...base,
     id: 'm2',
-    title: 'Лесной коридор',
-    desc: 'Пройди 8 ворот по порядку на север',
-    icon: '🚪',
-    mode: 'mission',
-    timeLimit: 150,
-    spawn: { pos: [0, 2.0, 6], yaw: 0 },
-    objectives: [
-      { type: 'gates', ids: [0, 1, 2, 3, 4, 5, 6, 7], desc: 'Пройти ворота 1-8' },
-    ],
-  },
-  {
-    id: 'm3',
-    title: 'Точный сброс',
-    desc: 'Доставь груз в 3 зоны сброса',
-    icon: '📦',
-    mode: 'mission',
-    timeLimit: 180,
-    spawn: { pos: [0, 1.6, 6], yaw: 0 },
-    objectives: [
-      { type: 'payload', ids: [0, 1, 2], desc: 'Сброс в зоны: 0/3' },
-    ],
-  },
-  {
-    id: 'm4',
-    title: 'Разведка огнём',
-    desc: 'Уничтожь 3 движущиеся цели',
-    icon: '🚙',
-    mode: 'mission',
-    timeLimit: 150,
-    spawn: { pos: [0, 1.6, 6], yaw: 0 },
-    objectives: [
-      { type: 'destroy', ids: [14, 15, 16], desc: 'Движущиеся цели: 0/3' },
-    ],
-  },
-  {
-    id: 'm5',
-    title: 'Штурм бункера',
-    desc: 'Зачисти бункер: 2 манекена, 2 бочки',
-    icon: '🛡️',
-    mode: 'mission',
-    timeLimit: 180,
-    spawn: { pos: [60, 1.6, 6], yaw: 0 },
-    objectives: [
-      { type: 'destroy', ids: [10, 11, 8, 9], desc: 'Цели у бункера: 0/4' },
-    ],
-  },
-  {
-    id: 'm6',
-    title: 'Мастер полигона',
-    desc: 'Ворота 1-4 → 3 цели → сброс в зону',
-    icon: '🏅',
-    mode: 'mission',
+    category: 'mission',
+    title: 'Доставка груза',
+    brief: 'Доставьте груз в две зоны: A (северо-запад) и B (восток). Ориентируйтесь по световым маякам.',
     timeLimit: 240,
-    spawn: { pos: [0, 2.0, 6], yaw: 0 },
+    parTime: 150,
+    payloads: 4,
+    zones: ['A', 'B'],
     objectives: [
-      { type: 'gates', ids: [0, 1, 2, 3], desc: 'Этап 1: ворота 1-4' },
-      { type: 'destroy', ids: [0, 4, 12], desc: 'Этап 2: 3 цели' },
-      { type: 'payload', ids: [0], desc: 'Этап 3: сброс в зону' },
+      { type: 'drop', zone: 'A', label: 'Сбросить груз в зону A' },
+      { type: 'drop', zone: 'B', label: 'Сбросить груз в зону B' },
     ],
   },
-];
-
-export const TRAININGS: MissionDef[] = [
   {
+    ...base,
+    id: 'm3',
+    category: 'mission',
+    title: 'Зачистка деревни',
+    brief: 'В деревне на северо-востоке — цели в зданиях и на улицах. Поразите 6 целей. Пролетайте через окна.',
+    timeLimit: 300,
+    parTime: 190,
+    payloads: 9,
+    groups: ['village'],
+    objectives: [{ type: 'destroy', count: 6, label: 'Поразить цели в деревне' }],
+  },
+  {
+    ...base,
+    id: 'm4',
+    category: 'mission',
+    title: 'Колонна',
+    brief: 'Колонна техники движется по главной дороге. Поразите 3 движущиеся цели — упреждайте.',
+    timeLimit: 200,
+    parTime: 120,
+    payloads: 8,
+    groups: ['convoy'],
+    objectives: [{ type: 'destroy', count: 3, label: 'Остановить колонну' }],
+  },
+  {
+    ...base,
+    id: 'm5',
+    category: 'mission',
+    title: 'Операция «Ночь»',
+    brief: 'Ночная операция: деревня и патруль у окопов. Поразите 8 целей. Камера работает на усилении — шума больше.',
+    timeLimit: 360,
+    parTime: 240,
+    payloads: 12,
+    groups: ['village', 'patrol'],
+    tod: 'night',
+    objectives: [{ type: 'destroy', count: 8, label: 'Поразить цели' }],
+  },
+  {
+    ...base,
     id: 't1',
+    category: 'training',
     title: 'Точность',
-    desc: '10 статичных целей — как можно быстрее',
-    icon: '⏱️',
-    mode: 'training',
-    timeLimit: 0,
-    spawn: { pos: [0, 1.6, 6], yaw: 0 },
-    starTimes: [100, 150],
-    objectives: [
-      { type: 'destroy', ids: [0, 1, 2, 3, 4, 5, 6, 7, 10, 12], desc: 'Цели: 0/10' },
-    ],
+    brief: 'Поразите все 6 щитов тира за минимальное время.',
+    timeLimit: 150,
+    parTime: 60,
+    payloads: 12,
+    groups: ['range'],
+    objectives: [{ type: 'destroy', count: 6, label: 'Поразить щиты' }],
   },
   {
+    ...base,
     id: 't2',
+    category: 'training',
     title: 'Слалом',
-    desc: 'Курс из 8 ворот на время',
-    icon: '🏁',
-    mode: 'training',
-    timeLimit: 0,
-    spawn: { pos: [0, 2.0, 6], yaw: 0 },
-    starTimes: [90, 130],
-    objectives: [
-      { type: 'gates', ids: [0, 1, 2, 3, 4, 5, 6, 7], desc: 'Ворота: 0/8' },
-    ],
+    brief: 'Пролетите 10 ворот по порядку. Следующие ворота подсвечены бирюзовым.',
+    timeLimit: 120,
+    parTime: 55,
+    gates: true,
+    objectives: [{ type: 'gates', count: 10, label: 'Пройти ворота' }],
   },
   {
+    ...base,
     id: 't3',
-    title: 'Висение',
-    desc: 'Удержись в кольце 15 секунд',
-    icon: '🎈',
-    mode: 'training',
-    timeLimit: 0,
-    spawn: { pos: [0, 1.6, 6], yaw: 0 },
-    objectives: [
-      { type: 'hover', anchor: [20, 8, 60], radius: 2.5, seconds: 15, desc: 'Висение: 0/15 с' },
-    ],
+    category: 'training',
+    title: 'Hover-тест',
+    brief: 'Удерживайте дрон в сфере 15 секунд (скорость < 2 м/с).',
+    timeLimit: 90,
+    parTime: 30,
+    hover: true,
+    objectives: [{ type: 'hover', seconds: 15, label: 'Удерживать позицию' }],
   },
   {
+    ...base,
     id: 't4',
+    category: 'training',
     title: 'Посадка',
-    desc: 'Мягко сядь на стартовый пад',
-    icon: '🛬',
-    mode: 'training',
-    timeLimit: 0,
-    spawn: { pos: [0, 12, 40], yaw: 0 },
-    starTimes: [25, 45],
+    brief: 'Поднимитесь на 20 м и мягко сядьте на площадку 2 (оранжевая, юго-восток).',
+    timeLimit: 150,
+    parTime: 70,
+    pads: ['L2'],
+    sequential: true,
     objectives: [
-      { type: 'land', radius: 3.4, desc: 'Приземлиться на пад' },
+      { type: 'altitude', altitude: 20, label: 'Набрать высоту 20 м' },
+      { type: 'land', pad: 'L2', label: 'Посадка на площадку 2' },
     ],
   },
 ];
 
-export const FREE_FLIGHT: MissionDef = {
+export const FREE: MissionDef = {
+  ...base,
   id: 'free',
+  category: 'free',
   title: 'Свободный полёт',
-  desc: 'Открытый полигон без ограничений',
-  icon: '🛸',
-  mode: 'free',
+  brief: 'Открытый полигон без ограничений.',
   timeLimit: 0,
-  spawn: { pos: [0, 1.6, 6], yaw: 0 },
+  parTime: 0,
+  payloads: -1,
+  groups: ['range', 'village', 'convoy', 'patrol'],
   objectives: [],
 };
